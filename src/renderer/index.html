@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;" />
+  <title>AI 伴侣管理器</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="app">
+    <aside id="sidebar">
+      <div class="logo">🤖 AI 伴侣<br /><small>一键部署管理器</small></div>
+      <nav id="nav">
+        <button data-view="home" class="active">🏠 环境检测</button>
+        <button data-view="services">⚙️ 服务管理</button>
+        <button data-view="config">🔑 凭证配置</button>
+        <button data-view="settings">🛠 高级设置</button>
+      </nav>
+      <div id="sidebar-foot"></div>
+    </aside>
+    <main id="content"></main>
+  </div>
+  <div id="toast"></div>
+  <script src="app.js"></script>
+</body>
+</html>
