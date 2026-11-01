@@ -27,32 +27,53 @@ function fetchRedirect(url, depth = 0) {
   });
 }
 
-// 下载到 destFile，onProgress(received, total) 每 ~2% 上报一次
-async function downloadFile(url, destFile, onProgress) {
+// 下载到 destFile，onProgress(received, total) 每 ~2% 上报一次。
+// opts.verifyZip = true 时校验 zip 魔数（PK\x03\x04）与 content-length 一致性，失败清理 .part。
+// 注意：只能通过 'data' 监听器写入，不能再挂 res.pipe(out)——
+// 早期版本两者并存会把每个 chunk 写两次，文件膨胀 2 倍导致 zip 损坏。
+async function downloadFile(url, destFile, onProgress, opts = {}) {
   const res = await fetchRedirect(url);
   const total = Number(res.headers['content-length']) || 0;
   const tmp = destFile + '.part';
   const out = fs.createWriteStream(tmp);
   let received = 0;
   let lastPct = -1;
-  await new Promise((resolve, reject) => {
-    res.on('data', (chunk) => {
-      received += chunk.length;
-      out.write(chunk);
-      if (onProgress && total) {
-        const pct = Math.floor((received / total) * 100);
-        if (pct >= lastPct + 2 || pct === 100) {
-          lastPct = pct;
-          onProgress(received, total);
+  try {
+    await new Promise((resolve, reject) => {
+      res.on('data', (chunk) => {
+        received += chunk.length;
+        out.write(chunk);
+        if (onProgress && total) {
+          const pct = Math.floor((received / total) * 100);
+          if (pct >= lastPct + 2 || pct === 100) {
+            lastPct = pct;
+            onProgress(received, total);
+          }
         }
-      }
+      });
+      res.on('end', () => out.end()); // 流读完显式结束写流（去掉 pipe 后需手动 end）
+      res.on('error', reject);
+      out.on('error', reject);
+      out.on('finish', resolve);
     });
-    res.on('error', reject);
-    out.on('error', reject);
-    out.on('finish', resolve);
-    res.pipe(out);
-  });
-  fs.renameSync(tmp, destFile);
+    // 完整性校验：zip 魔数 + 大小一致（仅当调用方要求）
+    if (opts.verifyZip) {
+      const head = Buffer.alloc(4);
+      const fd = fs.openSync(tmp, 'r');
+      fs.readSync(fd, head, 0, 4, 0);
+      fs.closeSync(fd);
+      if (!head.equals(Buffer.from([0x50, 0x4b, 0x03, 0x04]))) {
+        throw new Error('下载内容不是有效的 zip 包（魔数校验失败）');
+      }
+      if (total && received !== total) {
+        throw new Error(`下载不完整（${received}/${total} 字节）`);
+      }
+    }
+    fs.renameSync(tmp, destFile);
+  } catch (e) {
+    fs.rmSync(tmp, { force: true }); // 失败清理 .part，避免残留
+    throw e;
+  }
   return destFile;
 }
 
@@ -79,13 +100,27 @@ function npmInstall(cwd, nodeDir) {
   return new Promise((resolve) => {
     const env = { ...process.env };
     if (nodeDir) env.PATH = nodeDir + path.delimiter + env.PATH;
-    const npmCmd = nodeDir ? path.join(nodeDir, 'npm.cmd') : 'npm.cmd';
-    const child = spawn(npmCmd, ['install', '--no-audit', '--no-fund', '--registry=https://registry.npmmirror.com'], {
-      cwd,
-      env,
-      windowsHide: true,
-      shell: false,
-    });
+    // Windows 下 .cmd/.bat 不能直接被 spawn（CreateProcess 不解释批处理 → ENOENT）。
+    // 有便携 node 时用 node + npm-cli.js 精确执行；没有便携 node 时退回 cmd 包装 npm.cmd。
+    const npmArgs = ['install', '--no-audit', '--no-fund', '--registry=https://registry.npmmirror.com'];
+    let child;
+    if (nodeDir) {
+      const nodeBin = path.join(nodeDir, 'node.exe');
+      const npmCli = path.join(nodeDir, 'node_modules', 'npm', 'bin', 'npm-cli.js');
+      child = spawn(nodeBin, [npmCli, ...npmArgs], {
+        cwd,
+        env,
+        windowsHide: true,
+        shell: false,
+      });
+    } else {
+      child = spawn('npm.cmd', npmArgs, {
+        cwd,
+        env,
+        windowsHide: true,
+        shell: true,
+      });
+    }
     let tail = [];
     const collect = (buf) => {
       tail = tail.concat(buf.toString('utf8').split(/\r?\n/).filter(Boolean));

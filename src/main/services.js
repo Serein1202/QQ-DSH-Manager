@@ -51,7 +51,7 @@ function buildServiceList() {
       desc: 'QQ 协议端（OneBot v11）',
       startable: !!d.snowluma.entry,
       blockedReason: d.snowluma.state === 'missing' ? '未检测到 SnowLuma，先去首页安装' : '',
-      run: { cwd: d.snowluma.dir, command: node, args: ['index.mjs'] },
+      run: { cwd: d.snowluma.dir, command: node, args: ['index.mjs'], verify: ['index.mjs'] },
       probePorts: [3000, snow.webuiPort],
       webLinks: [
         { label: 'SnowLuma WebUI', url: `http://127.0.0.1:${snow.webuiPort}`, port: snow.webuiPort },
@@ -93,6 +93,8 @@ function buildServiceList() {
         // 只要是拿 DSH 的 Electron 本体执行 JS（不管入口在 asar 内还是磁盘上），
         // 都必须 ELECTRON_RUN_AS_NODE=1，否则它会当成桌面应用去开窗口而不是执行 CLI
         env: /\.exe"/i.test(cmd) ? { ELECTRON_RUN_AS_NODE: '1' } : {},
+        // 停止时用于确认进程身份（端口反查防误杀）：exe 名或 CLI 特征
+        verify: [dshExe ? path.basename(dshExe) : '', '--expose-internals'].filter(Boolean),
       },
       probePorts: [dshPort],
       webLinks: [{ label: 'DSH Web API', url: `http://127.0.0.1:${dshPort}`, port: dshPort }],
@@ -110,12 +112,12 @@ function buildServiceList() {
         {
           id: 'qqbridge-phone',
           name: '手机 MCP',
-          run: { cwd: d.companionkit.dir, command: ckNode, args: ['packages/phone-mcp/src/phone-mcp.js'] },
+          run: { cwd: d.companionkit.dir, command: ckNode, args: ['packages/phone-mcp/src/phone-mcp.js'], verify: ['phone-mcp.js'] },
         },
         {
           id: 'qqbridge-qzone',
           name: 'QQ 空间',
-          run: { cwd: d.companionkit.dir, command: ckNode, args: ['packages/qzone/open-zone.mjs'] },
+          run: { cwd: d.companionkit.dir, command: ckNode, args: ['packages/qzone/open-zone.mjs'], verify: ['open-zone.mjs'] },
         }
       );
     }
@@ -125,7 +127,7 @@ function buildServiceList() {
       desc: 'QQ ↔ DSH 桥接',
       startable: !!d.qqbridge.entry,
       blockedReason: d.qqbridge.state === 'missing' ? '未检测到 qq-bridge，先去首页安装' : d.qqbridge.state === 'warn' ? d.qqbridge.detail : '',
-      run: { cwd: d.qqbridge.dir, command: node, args: ['src/bridge.js'] },
+      run: { cwd: d.qqbridge.dir, command: node, args: ['src/bridge.js'], verify: ['bridge.js'] },
       probePorts: [qb.consolePort],
       companions,
       companionHint: companions.length ? `含 ${companions.map((c) => c.name).join(' / ')}，随桥接一起启停` : '',

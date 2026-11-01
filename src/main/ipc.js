@@ -5,7 +5,7 @@ const { spawnSync } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { settings, updateSettings, defaultScanRoot } = require('./store');
+const { settings, updateSettings, defaultScanRoot, scanRoots } = require('./store');
 const { detectAll, invalidateDetect, findNode } = require('./detect');
 const { ProcessManager, probePort } = require('./procs');
 const { buildServiceList, START_ORDER } = require('./services');
@@ -61,6 +61,88 @@ function listOnebotFiles(snowDir) {
     .map((f) => path.join(dir, f));
 }
 
+// ---------- 主进程侧入参校验（防渲染层被 XSS 后滥用敏感 handler） ----------
+const ALLOW_INSTALL_KEYS = new Set(['node', 'snowluma', 'dsh', 'qqbridge', 'companionkit']);
+const ALLOW_DOWNLOAD_KEYS = new Set(['snowluma', 'dsh', 'qqbridge', 'companionkit', 'node', 'managerUpdate']);
+const ALLOW_RESTART_KEYS = new Set(['snowluma', 'dsh', 'qqbridge', 'companionkit']);
+
+// settings:set 白名单 schema：未知字段丢弃、类型不符丢弃（number 允许字符串数字）
+const SETTINGS_SCHEMA = {
+  scanRoot: 'string',
+  closeStopServices: 'boolean',
+  components: {
+    snowluma: { dir: 'string' },
+    dsh: { dir: 'string', startCommand: 'string', port: 'number', workspace: 'string' },
+    qqbridge: { dir: 'string' },
+    companionkit: { dir: 'string' },
+  },
+  downloads: { keySet: ALLOW_DOWNLOAD_KEYS, type: 'stringMap' },
+  autoRestart: { keySet: ALLOW_RESTART_KEYS, type: 'booleanMap' },
+};
+
+function sanitizeBySchema(value, schema) {
+  if (schema === 'string') return typeof value === 'string' ? value : undefined;
+  if (schema === 'boolean') return typeof value === 'boolean' ? value : undefined;
+  if (schema === 'number') {
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+    if (typeof value === 'string' && value.trim() !== '' && Number.isFinite(Number(value))) return Number(value);
+    return undefined;
+  }
+  if (schema.type === 'stringMap') {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+    const out = {};
+    for (const k of Object.keys(value)) {
+      if (schema.keySet.has(k) && typeof value[k] === 'string') out[k] = value[k];
+    }
+    return out;
+  }
+  if (schema.type === 'booleanMap') {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+    const out = {};
+    for (const k of Object.keys(value)) {
+      if (schema.keySet.has(k) && typeof value[k] === 'boolean') out[k] = value[k];
+    }
+    return out;
+  }
+  // 嵌套对象
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    const out = {};
+    for (const k of Object.keys(schema)) {
+      const v = sanitizeBySchema(value[k], schema[k]);
+      if (v !== undefined) out[k] = v;
+    }
+    return Object.keys(out).length ? out : undefined;
+  }
+  return undefined;
+}
+
+// 路径是否位于任一扫描根目录内（dl:install 的 targetDir 限制）
+function isUnderScanRoots(p) {
+  if (!p) return false;
+  const resolved = path.resolve(p);
+  return scanRoots().some((root) => {
+    const rel = path.relative(path.resolve(root), resolved);
+    return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+  });
+}
+
+// config:write 只允许写这几个文件：qq-bridge config.json、SnowLuma runtime.json、onebot_*.json
+function isAllowedConfigFile(file) {
+  if (!file || typeof file !== 'string') return false;
+  const resolved = path.resolve(file).toLowerCase();
+  const d = detectAll();
+  if (d.qqbridge.dir && path.resolve(path.join(d.qqbridge.dir, 'config.json')).toLowerCase() === resolved) return true;
+  if (d.snowluma.dir) {
+    const cfgDir = path.resolve(path.join(d.snowluma.dir, 'config'));
+    if (path.resolve(path.join(cfgDir, 'runtime.json')).toLowerCase() === resolved) return true;
+    const name = path.basename(resolved);
+    if (path.dirname(path.resolve(resolved)) === path.resolve(cfgDir).toLowerCase() && /^onebot_\d+\.json$/.test(name)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // ---------- 安装流程 ----------
 async function installComponent(key, targetDir, onStep) {
   const s = settings();
@@ -71,7 +153,7 @@ async function installComponent(key, targetDir, onStep) {
     if (!url) throw new Error('未配置 Node 便携版下载地址');
     step('下载 Node 便携版…');
     const zip = path.join(defaultScanRoot(), 'tools', 'node-portable.zip');
-    await downloadFile(url, zip, (r, t) => send('dl:progress', { key, received: r, total: t }));
+    await downloadFile(url, zip, (r, t) => send('dl:progress', { key, received: r, total: t }), { verifyZip: true });
     step('解压…');
     unzip(zip, path.join(defaultScanRoot(), 'tools', '_runtime', 'node'));
     fs.unlinkSync(zip);
@@ -91,7 +173,7 @@ async function installComponent(key, targetDir, onStep) {
 
   step('下载压缩包…');
   const tmpZip = path.join(defaultScanRoot(), `__dl_${key}.zip`);
-  await downloadFile(url, tmpZip, (r, t) => send('dl:progress', { key, received: r, total: t }));
+  await downloadFile(url, tmpZip, (r, t) => send('dl:progress', { key, received: r, total: t }), { verifyZip: true });
   step('解压…');
   unzip(tmpZip, targetDir);
   fs.unlinkSync(tmpZip);
@@ -230,21 +312,28 @@ function registerIpc() {
           }
           await new Promise((res) => setTimeout(res, 800));
         }
-        if (!up) results.push({ id, ok: false, warn: `${id} 启动后端口未就绪（可能需要扫码登录）` });
+        if (!up) {
+          // 端口超时不追加新记录：更新原启动记录避免前端重复报"未启动"
+          const rec = results.find((r) => r.id === id && r.ok);
+          if (rec) rec.warn = `${id} 启动后端口未就绪（可能需要扫码登录）`;
+          else results.push({ id, ok: false, warn: `${id} 启动后端口未就绪（可能需要扫码登录）` });
+        }
       }
     }
     return results;
   });
 
   ipcMain.handle('svc:stopAll', () => {
-    // 传入每个服务的探活端口 + 工作目录：非托管（用户手动开的）服务也能停掉
+    // 传入每个服务的探活端口 + 工作目录 + 身份特征：非托管（用户手动开的）服务也能停掉，且不误杀
     const portsById = {};
     const cwdById = {};
+    const optsById = {};
     for (const svc of buildServiceList()) {
       portsById[svc.id] = svc.probePorts;
       cwdById[svc.id] = svc.run.cwd || '';
+      optsById[svc.id] = { verify: svc.run.verify || [] };
     }
-    return pm.stopAll(portsById, cwdById);
+    return pm.stopAll(portsById, cwdById, optsById);
   });
 
   // 配置读写
@@ -280,6 +369,12 @@ function registerIpc() {
 
   ipcMain.handle('config:write', (_e, { file, apply }) => {
     // apply: [{ path, value }]，一次性合并写回，减少多次备份
+    // 主进程侧校验：只允许写检测到的组件配置文件（qq-bridge config.json / SnowLuma runtime.json / onebot_*.json）
+    if (!isAllowedConfigFile(file)) return { ok: false, error: '目标文件不在允许写入的配置范围内' };
+    if (!Array.isArray(apply) || !apply.length) return { ok: false, error: '无效的写入请求' };
+    for (const item of apply) {
+      if (!item || typeof item.path !== 'string') return { ok: false, error: '无效的写入路径' };
+    }
     let data = {};
     try {
       data = JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -293,10 +388,16 @@ function registerIpc() {
 
   // 下载 / 安装
   ipcMain.handle('dl:install', async (_e, { key, targetDir }) => {
+    if (!ALLOW_INSTALL_KEYS.has(key)) return { ok: false, error: '未知的安装组件' };
     if (downloads.get(key)) return { ok: false, error: '该组件正在安装中' };
     downloads.set(key, true);
     try {
       const dir = targetDir || path.join(defaultScanRoot(), key === 'qqbridge' ? 'qq-bridge' : key);
+      // 主进程侧校验：安装目标目录必须位于扫描根内，防止任意路径写入
+      if (!isUnderScanRoots(dir)) {
+        downloads.delete(key);
+        return { ok: false, error: '安装目录不在允许范围内（仅限扫描根目录）' };
+      }
       await installComponent(key, dir, (msg) => send('dl:step', { key, msg }));
       send('dl:done', { key, ok: true });
       return { ok: true, dir };
@@ -330,7 +431,10 @@ function registerIpc() {
   // 设置
   ipcMain.handle('settings:get', () => settings());
   ipcMain.handle('settings:set', (_e, patch) => {
-    const r = updateSettings(patch);
+    // 主进程侧白名单 schema 校验：未知字段/非法类型直接丢弃，防止注入恶意 startCommand / 下载地址
+    const clean = sanitizeBySchema(patch || {}, SETTINGS_SCHEMA);
+    if (!clean || typeof clean !== 'object') return { ok: false, error: '无效的设置内容' };
+    const r = updateSettings(clean);
     invalidateDetect(); // 目录变了立刻重扫
     return r;
   });
@@ -381,10 +485,30 @@ function registerIpc() {
   });
 
   // 下载新版安装包到临时目录，下载完自动运行（NSIS 安装器会自己接管）
+  // 收紧：仅允许从配置的 managerUpdate 清单地址下载、扩展名必须是 .exe、打开前弹确认
   ipcMain.handle('update:install', async (_e, { url }) => {
     try {
+      const manifest = settings().downloads.managerUpdate;
+      if (!manifest || !/^https?:\/\//.test(manifest)) return { ok: false, error: '未配置更新清单地址' };
       if (!url || !/^https?:\/\//.test(url)) return { ok: false, error: '无效的下载地址' };
-      const name = path.basename(new URL(url).pathname) || 'update-installer.exe';
+      // 只允许清单同源的 exe 直链（防止任意 URL 下载执行）
+      let destPath = '';
+      try {
+        destPath = new URL(url).pathname;
+      } catch {
+        return { ok: false, error: '无效的下载地址' };
+      }
+      if (!/\.exe$/i.test(destPath) && !/\.exe\?/i.test(url)) return { ok: false, error: '安装包必须是 .exe 文件' };
+      const ans = await dialog.showMessageBox({
+        type: 'warning',
+        title: '确认安装更新',
+        message: `即将下载并运行更新安装包：\n${url}\n\n确认继续？`,
+        buttons: ['确认下载并运行', '取消'],
+        cancelId: 1,
+        defaultId: 0,
+      });
+      if (ans.response !== 0) return { ok: false, error: '已取消更新' };
+      const name = path.basename(destPath) || 'update-installer.exe';
       const dest = path.join(os.tmpdir(), 'cm-update-' + name);
       await downloadFile(url, dest, (r, t) => send('dl:progress', { key: 'update', received: r, total: t }));
       const err = shell.openPath(dest);
@@ -407,13 +531,36 @@ function registerIpc() {
     return { ok: false, error: '未找到 launcher.bat' };
   });
 
-  // 退出时按设置清理
+  // 退出时按设置清理：崩溃自动重启（连续失败退避 + 恢复附属服务）
   pm.onExit = (id) => {
     send('proc:exit', { id });
-    if (settings().autoRestart[id]) {
-      const svc = buildServiceList().find((x) => x.id === id);
-      if (svc && svc.startable) setTimeout(() => pm.start(id, svc.run), 3000);
+    const auto = settings().autoRestart;
+    if (!auto || !auto[id]) return;
+    const svc = buildServiceList().find((x) => x.id === id);
+    if (!svc || !svc.startable) return;
+
+    // 连续崩溃保护：60s 窗口内第 3 次崩溃就停止重启，避免秒崩服务无限循环
+    const now = Date.now();
+    const s = pm.restartStats.get(id);
+    if (!s || now - s.windowStart > 60000) {
+      pm.restartStats.set(id, { count: 1, windowStart: now });
+    } else {
+      s.count += 1;
+      if (s.count >= 3) {
+        send('proc:log', { id, line: `[${new Date().toLocaleTimeString()}] 连续崩溃 ${s.count} 次，已停止自动重启` });
+        return;
+      }
     }
+    const st = pm.restartStats.get(id);
+    const delay = Math.min(3000 * Math.pow(2, st.count - 1), 15000); // 3s → 6s → 12s 退避
+    setTimeout(() => {
+      const r = pm.start(id, svc.run);
+      if (!r.ok) send('proc:log', { id, line: `[${new Date().toLocaleTimeString()}] 自动重启失败: ${r.error}` });
+      // 附属服务（qq-bridge 的手机 MCP / QQ 空间）随主服务一起恢复
+      for (const c of svc.companions || []) {
+        pm.start(c.id, { ...c.run, logTo: id, logPrefix: c.name });
+      }
+    }, delay);
   };
 }
 

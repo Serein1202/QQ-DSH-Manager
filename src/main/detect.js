@@ -158,8 +158,12 @@ function detectAllImpl() {
   const snowNodeVer = snowNode ? nodeVersion(snowNode) : '';
 
   // ---- DSH ----
+  // 目录名含关键词不算安装：残留目录（卸载未删净）也会命中，必须校验 exe / app.asar 存在
   const dshConf = s.components.dsh || {};
-  const dshDir = dshConf.dir || pickDir(discoverMatches(['dsh', 'deepseek', 'harness'], /qq-bridge/i));
+  const dshCands = discoverMatches(['dsh', 'deepseek', 'harness'], /qq-bridge/i).filter(
+    (d) => findDshExe(d) || exists(path.join(d, 'resources', 'app.asar'))
+  );
+  const dshDir = (dshConf.dir && isDir(dshConf.dir)) ? dshConf.dir : dshCands[0] || '';
   const dshPort = dshConf.port || 3080;
   const dshLaunch = findDshLaunch(dshDir, dshConf.workspace, dshConf.cliDir);
 
@@ -199,7 +203,7 @@ function detectAllImpl() {
           : '目录存在但缺 index.mjs',
     },
     dsh: {
-      state: dshDir ? 'ok' : 'missing',
+      state: dshDir && dshLaunch.exe ? 'ok' : dshDir ? 'warn' : 'missing',
       dir: dshDir,
       port: dshPort,
       startCommand: dshConf.startCommand || '',
@@ -208,11 +212,13 @@ function detectAllImpl() {
       cliReal: dshLaunch.cliReal,
       cliDir: dshConf.cliDir || '',
       workspace: dshLaunch.workspace,
-      detail: dshDir
-        ? dshLaunch.cli
-          ? `dsh web · ${dshLaunch.workspace}` + (dshLaunch.cliReal ? '' : '（CLI 在 app.asar 内，插件市场更新会失败）')
-          : '已安装，但未找到 dsh CLI（app.asar 缺失，建议重装 DSH）'
-        : '未找到目录（官网下载后，请在"高级设置"里指定目录）',
+      detail: !dshDir
+        ? '未找到目录（官网下载后，请在"高级设置"里指定目录）'
+        : !dshLaunch.exe
+          ? '目录存在但未找到可执行文件（可能已卸载或安装不完整，建议重装 DSH）'
+          : dshLaunch.cli
+            ? `dsh web · ${dshLaunch.workspace}` + (dshLaunch.cliReal ? '' : '（CLI 在 app.asar 内，插件市场更新会失败）')
+            : '已安装，但未找到 dsh CLI（app.asar 缺失，建议重装 DSH）',
     },
     qqbridge: {
       state:

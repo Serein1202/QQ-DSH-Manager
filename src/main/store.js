@@ -4,11 +4,11 @@ const { app } = require('electron');
 const fs = require('fs');
 const path = require('path');
 
-// 各下载源默认值。snowluma / dsh 官网地址留空，用户可在"高级设置"里填入；
+// 各下载源默认值。snowluma / dsh 默认官网地址（网页跳转），用户可在"高级设置"里覆盖；
 // 填了 zip 直链就自动下载解压，只填网页地址就跳浏览器。
 const DEFAULT_DOWNLOADS = {
-  snowluma: '',
-  dsh: '',
+  snowluma: 'https://github.com/SnowLuma/SnowLuma/releases',
+  dsh: 'https://www.deepseek.com/harness/',
   qqbridge:
     'https://gh-proxy.com/https://github.com/Derpyu520/qq-bridge/archive/refs/heads/main.zip',
   companionkit:

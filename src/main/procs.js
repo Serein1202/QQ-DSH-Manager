@@ -136,6 +136,33 @@ function pidsByPort(port) {
   return pids;
 }
 
+// 批量反查 PID 的命令行：停止前确认进程身份，避免误杀无关进程。
+// 返回 [{ pid, cmdline }]，查不到命令行的 PID 也带空 cmdline（权限不足/僵尸进程）。
+function pidsInfo(pids) {
+  if (!pids || !pids.length) return [];
+  try {
+    const idList = [...new Set(pids)].map(Number).join(',');
+    const r = spawnSync(
+      'powershell.exe',
+      [
+        '-NoProfile',
+        '-NonInteractive',
+        '-Command',
+        `Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessId -in @(${idList}) } | ForEach-Object { $_.ProcessId.ToString() + '|' + $_.CommandLine }`,
+      ],
+      { encoding: 'utf8', timeout: 15000, windowsHide: true }
+    );
+    const out = [];
+    for (const line of String(r.stdout || '').split(/\r?\n/)) {
+      const i = line.indexOf('|');
+      if (i > 0) out.push({ pid: Number(line.slice(0, i)), cmdline: line.slice(i + 1) });
+    }
+    return out;
+  } catch {
+    return pids.map((p) => ({ pid: p, cmdline: '' }));
+  }
+}
+
 function killPidTree(pid) {
   try {
     const r = spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { encoding: 'utf8', timeout: 8000 });
@@ -151,6 +178,12 @@ class ProcessManager {
     this.logs = new Map(); // id -> string[]
     this.onExit = null; // (id, code) => void，由 ipc 层注入
     this.onLog = null; // (id, line) => void
+    this.userStopped = new Set(); // 用户主动 stop 的 id：退出时不算崩溃，不触发自动重启
+    this.restartStats = new Map(); // id -> { count, timer } 崩溃自动重启计数（60s 窗口退避）
+  }
+
+  clearCrash(id) {
+    this.restartStats.delete(id);
   }
 
   isRunning(id) {
@@ -243,7 +276,13 @@ class ProcessManager {
     child.on('exit', (code, signal) => {
       push(`[${new Date().toLocaleTimeString()}] 进程退出 (code=${code}, signal=${signal})`);
       this.procs.delete(id);
-      if (this.onExit) this.onExit(id, code);
+      // 用户主动停止导致的退出不算崩溃：不触发自动重启，也不累计崩溃计数
+      if (this.userStopped.has(id)) {
+        this.userStopped.delete(id);
+        this.clearCrash(id);
+      } else if (this.onExit) {
+        this.onExit(id, code);
+      }
     });
     return { ok: true, pid: child.pid };
   }
@@ -251,15 +290,17 @@ class ProcessManager {
   // Windows 下必须树杀，否则 node 的子进程会残留
   // ports: 服务监听的端口列表；cwd: 服务工作目录（端口查不到时按命令行兜底）。
   // 服务不是本管理器拉起时（用户手动开 / 上次残留），反查 PID 强杀，否则永远停不掉。
-  stop(id, ports = [], cwd = '') {
+  stop(id, ports = [], cwd = '', opts = {}) {
     const p = this.procs.get(id);
     if (p && p.pid) {
+      this.userStopped.add(id); // 主动停止：exit 时不触发崩溃自动重启
       try {
         const r = spawnSync('taskkill', ['/PID', String(p.pid), '/T', '/F'], { encoding: 'utf8', timeout: 8000 });
         this.procs.delete(id);
         this.pushLog(id, `[${new Date().toLocaleTimeString()}] 已停止`);
         return { ok: r.status === 0, error: r.status !== 0 ? (r.stderr || '').trim() : '' };
       } catch (e) {
+        this.userStopped.delete(id);
         return { ok: false, error: e.message };
       }
     }
@@ -274,26 +315,37 @@ class ProcessManager {
       for (const pid of pidsByCmdline(cwd)) pids.add(pid);
     }
     if (!pids.size) return { ok: false, error: '服务未在运行' };
+
+    // 防误杀：只杀身份能确认的进程。端口可能被无关程序占用，仅凭"在监听"不能断定是本服务。
+    // 服务的 run.verify 是启动命令特征（如 index.mjs / bridge.js / --expose-internals），
+    // 命令行命中特征才算；查不到命令行的 PID 直接放过（宁可停不掉，也不误杀）。
+    const verify = (opts && opts.verify) || [];
+    const targets = pidsInfo([...pids]).filter(
+      (info) => info.cmdline && verify.length && verify.some((v) => v && info.cmdline.includes(v))
+    );
+    if (!targets.length) return { ok: false, error: '端口有进程但无法确认是本服务（已取消停止以避免误杀）' };
+
     const errors = [];
-    for (const pid of pids) {
-      if (!killPidTree(pid)) errors.push(pid);
+    for (const t of targets) {
+      if (!killPidTree(t.pid)) errors.push(t.pid);
     }
-    this.pushLog(id, `[${new Date().toLocaleTimeString()}] 已停止外部进程 (pid ${[...pids].join(', ')})`);
+    const killed = targets.filter((t) => !errors.includes(t.pid)).map((t) => t.pid);
+    this.pushLog(id, `[${new Date().toLocaleTimeString()}] 已停止外部进程 (pid ${killed.join(', ')})`);
     return errors.length
       ? { ok: false, error: `部分进程停止失败: ${errors.join(', ')}` }
       : { ok: true };
   }
 
-  stopAll(portsById = {}, cwdById = {}) {
+  stopAll(portsById = {}, cwdById = {}, optsById = {}) {
     const stopped = [];
     // 托管的直接杀
     for (const id of [...this.procs.keys()]) {
-      if (this.stop(id, portsById[id] || [], cwdById[id] || '').ok) stopped.push(id);
+      if (this.stop(id, portsById[id] || [], cwdById[id] || '', optsById[id] || {}).ok) stopped.push(id);
     }
     // 非托管但端口在线的也一并处理
     for (const id of Object.keys(portsById)) {
       if (stopped.includes(id)) continue;
-      const r = this.stop(id, portsById[id], cwdById[id] || '');
+      const r = this.stop(id, portsById[id], cwdById[id] || '', optsById[id] || {});
       if (r.ok) stopped.push(id);
     }
     return stopped;
