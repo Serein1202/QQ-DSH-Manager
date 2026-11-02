@@ -13,7 +13,7 @@ function createWindow() {
     height: 780,
     minWidth: 960,
     minHeight: 640,
-    title: 'AI 伴侣管理器',
+    title: 'QQ-DSH-Manager',
     autoHideMenuBar: true,
     webPreferences: {
       preload: path.join(__dirname, '..', 'preload.js'),

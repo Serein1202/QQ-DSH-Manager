@@ -1,9 +1,9 @@
 {
-  "name": "companion-manager",
+  "name": "qq-dsh-manager",
   "version": "1.0.4",
   "description": "拟人化 AI 一键部署管理器：SnowLuma / DSH / qq-bridge / ai-companion-kit",
   "main": "src/main/index.js",
-  "author": "companion-manager",
+  "author": "Serein1202",
   "license": "MIT",
   "scripts": {
     "start": "electron .",

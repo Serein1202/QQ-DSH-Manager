@@ -10,7 +10,7 @@ function fetchRedirect(url, depth = 0) {
   return new Promise((resolve, reject) => {
     if (depth > 5) return reject(new Error('重定向次数过多'));
     const mod = url.startsWith('https:') ? https : http;
-    const req = mod.get(url, { headers: { 'User-Agent': 'companion-manager/1.0' } }, (res) => {
+    const req = mod.get(url, { headers: { 'User-Agent': 'QQ-DSH-Manager/1.0' } }, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         res.resume();
         const next = new URL(res.headers.location, url).toString();

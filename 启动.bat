@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 >nul
-title AI 伴侣管理器 - 启动器
+title QQ-DSH-Manager - 启动器
 setlocal
 cd /d "%~dp0"
 set "APP_DIR=%~dp0"
@@ -33,7 +33,7 @@ if not exist "%ELECTRON%" (
   exit /b 1
 )
 
-echo [2/2] 启动 AI 伴侣管理器...
+echo [2/2] 启动 QQ-DSH-Manager...
 rem 注意：不能传 "%APP_DIR%"——%~dp0 结尾的反斜杠会把引号转义掉（\" 被当成转义），
 rem       Electron 会收到带杂引号的路径报 "Unable to find Electron app"。前面已 cd 到目录，直接传 . 即可。
 rem 用 start 分离启动 + 立即退出，避免留下常驻黑窗口（关掉黑窗口会连带杀掉程序）

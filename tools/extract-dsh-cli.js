@@ -89,7 +89,7 @@ try {
   }
   console.log('完成。DSH 的 CLI 入口现在在这里：');
   console.log(`  ${entry}`);
-  console.log('AI 伴侣管理器会自动优先使用它；插件市场也就能正常更新了。');
+  console.log('QQ-DSH-Manager 会自动优先使用它；插件市场也就能正常更新了。');
 } finally {
   fs.rmSync(tmp, { recursive: true, force: true });
 }

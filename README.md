@@ -1,4 +1,4 @@
-# AI 伴侣管理器（companion-manager）
+# QQ-DSH-Manager
 
 给小白用的拟人化 AI 桌面部署管理器。管四样东西：**SnowLuma**（QQ 协议端）、**DSH**（DeepSeek Harness）、**qq-bridge**（桥接）、**ai-companion-kit**（记忆/手机MCP/空间）。
 
@@ -18,7 +18,7 @@
 命令行方式：
 
 ```bash
-cd companion-manager
+cd QQ-DSH-Manager
 npm install          # 已配 npmmirror + electron 镜像，国内可直接装
 npm start            # 启动软件
 ```
@@ -64,7 +64,7 @@ node tools/extract-dsh-cli.js
 ## 目录结构
 
 ```
-companion-manager/
+QQ-DSH-Manager/
 ├── package.json               # electron + electron-builder
 ├── electron-builder.yml       # nsis + portable 双打包配置
 ├── .npmrc                     # npmmirror 镜像
