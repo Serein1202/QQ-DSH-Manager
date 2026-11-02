@@ -7,6 +7,10 @@ const fs = require('fs');
 
 const LOG_LIMIT = 1000; // 每服务保留最近 1000 行
 
+// DSH web 启动时会打印 `dsh web: http://127.0.0.1:3080/?token=xxx`，
+// token 仅进程启动时 mint 一次、不落盘，必须从该行捕获，供 Web 入口按钮拼接
+const DSH_WEB_URL_RE = /dsh web:\s*(https?:\/\/[^\s"'<>]+)/i;
+
 // shell 元字符：出现即说明是复合命令（管道/重定向/变量/串联），只能交给 cmd
 const CMD_META = /[|&<>^%]/;
 
@@ -176,10 +180,15 @@ class ProcessManager {
   constructor() {
     this.procs = new Map(); // id -> ChildProcess
     this.logs = new Map(); // id -> string[]
+    this.webTokens = new Map(); // id -> 从启动日志捕获的 Web token（如 DSH 的 ?token=）
     this.onExit = null; // (id, code) => void，由 ipc 层注入
     this.onLog = null; // (id, line) => void
     this.userStopped = new Set(); // 用户主动 stop 的 id：退出时不算崩溃，不触发自动重启
     this.restartStats = new Map(); // id -> { count, timer } 崩溃自动重启计数（60s 窗口退避）
+  }
+
+  getWebToken(id) {
+    return this.webTokens.get(id) || '';
   }
 
   clearCrash(id) {
@@ -201,6 +210,15 @@ class ProcessManager {
     const arr = this.logs.get(id);
     arr.push(line);
     if (arr.length > LOG_LIMIT) arr.splice(0, arr.length - LOG_LIMIT);
+    // 捕获 DSH web 启动时打印的带 token URL（`dsh web: http://.../?token=xxx`）
+    const m = DSH_WEB_URL_RE.exec(line);
+    if (m) {
+      try {
+        const u = new URL(m[1]);
+        const t = u.searchParams.get('token');
+        if (t) this.webTokens.set(id, t);
+      } catch {}
+    }
     if (this.onLog) this.onLog(id, line);
   }
 

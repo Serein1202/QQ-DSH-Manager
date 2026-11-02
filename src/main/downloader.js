@@ -3,6 +3,8 @@
 const https = require('https');
 const http = require('http');
 const fs = require('fs');
+const os = require('os');
+const crypto = require('crypto');
 const path = require('path');
 const { spawn, spawnSync } = require('child_process');
 
@@ -78,15 +80,20 @@ async function downloadFile(url, destFile, onProgress, opts = {}) {
 }
 
 // 用 PowerShell Expand-Archive 解压（Windows 自带，免第三方依赖）
+// 注意：临时解压目录必须用绝对路径（os.tmpdir()），不能写 '$env:TEMP' 之类的
+// 环境变量引用——若用单引号包裹，PowerShell 不会展开，字面量 "$env:" 会被当成
+// 驱动器解析导致 DriveNotFound 解压失败（曾在新电脑上复现）。
 function unzip(zipFile, destDir) {
   fs.mkdirSync(destDir, { recursive: true });
+  const tmpDir = path.join(os.tmpdir(), 'cm-unzip-' + crypto.randomBytes(4).toString('hex'));
+  const sq = (s) => s.replace(/'/g, "''");
   const ps =
     `$ErrorActionPreference='Stop';` +
-    `Expand-Archive -Path '${zipFile.replace(/'/g, "''")}' -DestinationPath '$env:TEMP\\cm-unzip' -Force;` +
-    `$d = Get-ChildItem '$env:TEMP\\cm-unzip' -Directory | Select-Object -First 1;` +
-    `if ($d) { Copy-Item ($d.FullName + '\\*') '${destDir.replace(/'/g, "''")}' -Recurse -Force }` +
-    `else { Copy-Item '$env:TEMP\\cm-unzip\\*' '${destDir.replace(/'/g, "''")}' -Recurse -Force };` +
-    `Remove-Item '$env:TEMP\\cm-unzip' -Recurse -Force -ErrorAction SilentlyContinue`;
+    `Expand-Archive -Path '${sq(zipFile)}' -DestinationPath '${sq(tmpDir)}' -Force;` +
+    `$d = Get-ChildItem '${sq(tmpDir)}' -Directory | Select-Object -First 1;` +
+    `if ($d) { Copy-Item ($d.FullName + '\\*') '${sq(destDir)}' -Recurse -Force }` +
+    `else { Copy-Item '${sq(tmpDir)}\\*' '${sq(destDir)}' -Recurse -Force };` +
+    `Remove-Item '${sq(tmpDir)}' -Recurse -Force -ErrorAction SilentlyContinue`;
   const r = spawnSync('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', ps], {
     encoding: 'utf8',
     timeout: 300000,
@@ -95,14 +102,14 @@ function unzip(zipFile, destDir) {
   return destDir;
 }
 
-// npm install（可指定 node/npm 目录；npmmirror 兜底）
-function npmInstall(cwd, nodeDir) {
+// 单次 npm install（registry 由调用方指定）
+function runNpm(cwd, nodeDir, registry) {
   return new Promise((resolve) => {
     const env = { ...process.env };
     if (nodeDir) env.PATH = nodeDir + path.delimiter + env.PATH;
     // Windows 下 .cmd/.bat 不能直接被 spawn（CreateProcess 不解释批处理 → ENOENT）。
     // 有便携 node 时用 node + npm-cli.js 精确执行；没有便携 node 时退回 cmd 包装 npm.cmd。
-    const npmArgs = ['install', '--no-audit', '--no-fund', '--registry=https://registry.npmmirror.com'];
+    const npmArgs = ['install', '--no-audit', '--no-fund', '--registry=' + registry];
     let child;
     if (nodeDir) {
       const nodeBin = path.join(nodeDir, 'node.exe');
@@ -133,6 +140,17 @@ function npmInstall(cwd, nodeDir) {
       resolve({ ok: code === 0, error: code === 0 ? '' : `npm install 退出码 ${code}`, log: tail })
     );
   });
+}
+
+// npm install（可指定 node/npm 目录；优先 npmmirror，失败自动换官方源兜底）
+async function npmInstall(cwd, nodeDir) {
+  const registries = ['https://registry.npmmirror.com', 'https://registry.npmjs.org'];
+  let last;
+  for (const registry of registries) {
+    last = await runNpm(cwd, nodeDir, registry);
+    if (last.ok) return last;
+  }
+  return last;
 }
 
 // 拉取 JSON（更新清单用）

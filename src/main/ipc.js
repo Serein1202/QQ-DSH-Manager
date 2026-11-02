@@ -178,20 +178,21 @@ async function installComponent(key, targetDir, onStep) {
   fs.unlinkSync(tmpZip);
 
   if (key === 'qqbridge') {
+    // 仓库不含 config.json（只有 example），解压后先兜底生成，避免 npm 失败导致永远缺失
+    const example = path.join(targetDir, 'config.example.json');
+    const target = path.join(targetDir, 'config.json');
+    if (fs.existsSync(example) && !fs.existsSync(target)) {
+      fs.copyFileSync(example, target);
+      step('已生成 config.json（去"配置"页填写凭证）');
+    }
     step('安装依赖（npm install，可能要几分钟）…');
     const nodeDir = path.join(defaultScanRoot(), 'tools', '_runtime', 'node');
     const nodeExe = path.join(nodeDir, 'node.exe');
     const res = await npmInstall(targetDir, fs.existsSync(nodeExe) ? nodeDir : '');
-    if (!res.ok) throw new Error(res.error);
-    step('依赖安装完成');
-    if (key === 'qqbridge') {
-      const example = path.join(targetDir, 'config.example.json');
-      const target = path.join(targetDir, 'config.json');
-      if (fs.existsSync(example) && !fs.existsSync(target)) {
-        fs.copyFileSync(example, target);
-        step('已生成 config.json（去"配置"页填写凭证）');
-      }
+    if (!res.ok) {
+      throw new Error(res.error + (res.log && res.log.length ? '\n最近日志：\n' + res.log.slice(-15).join('\n') : ''));
     }
+    step('依赖安装完成');
   }
   step('安装完成');
 }
@@ -216,6 +217,17 @@ function registerIpc() {
   // 服务列表 + 状态（全部探活并发，单个 600ms 超时，5 个服务最坏 ~0.6s 出全量结果）
   ipcMain.handle('svc:list', async () => {
     const list = buildServiceList();
+    // DSH Web 入口：进程启动时 mint 的 token 只出现在启动日志里，
+    // 这里把捕获到的 token 拼进 URL，避免用户首次点击 3080 被认证拦截后手动翻日志
+    const dshToken = pm.getWebToken('dsh');
+    if (dshToken) {
+      const dsh = list.find((x) => x.id === 'dsh');
+      const link = dsh && dsh.webLinks[0];
+      if (link) {
+        const sep = link.url.includes('?') ? '&' : '?';
+        link.url = link.url + sep + 'token=' + encodeURIComponent(dshToken);
+      }
+    }
     const out = await Promise.all(
       list.map(async (svc) => {
         const entries = await Promise.all(svc.probePorts.map(async (p) => [p, await probePort(p, '127.0.0.1', 600)]));
@@ -440,6 +452,19 @@ function registerIpc() {
     const nodeExe = path.join(nodeDir, 'node.exe');
     send('dl:step', { key: 'fix', msg: `npm install @ ${dir}` });
     const res = await npmInstall(dir, fs.existsSync(nodeExe) ? nodeDir : '');
+    if (res.ok) {
+      // 修复成功后兜底补齐 config.json（仓库不含，只有 example）
+      const example = path.join(dir, 'config.example.json');
+      const target = path.join(dir, 'config.json');
+      if (fs.existsSync(example) && !fs.existsSync(target)) {
+        try {
+          fs.copyFileSync(example, target);
+        } catch (e) {}
+      }
+      invalidateDetect();
+    } else {
+      res.error = res.error + (res.log && res.log.length ? '\n最近日志：\n' + res.log.slice(-15).join('\n') : '');
+    }
     send('dl:done', { key: 'fix', ok: res.ok, error: res.error });
     return res;
   });
