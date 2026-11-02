@@ -212,8 +212,11 @@ function cmpVer(a, b) {
 
 // ---------- IPC 注册 ----------
 function registerIpc() {
-  // 检测
-  ipcMain.handle('detect:all', () => detectAll());
+  // 检测（force=true 时清 15s 缓存强制重扫）
+  ipcMain.handle('detect:all', (_e, opts) => {
+    if (opts && opts.force) invalidateDetect();
+    return detectAll();
+  });
 
   // 服务列表 + 状态（全部探活并发，单个 600ms 超时，5 个服务最坏 ~0.6s 出全量结果）
   ipcMain.handle('svc:list', async () => {

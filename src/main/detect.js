@@ -79,7 +79,8 @@ function isDir(p) {
   }
 }
 
-// 找可用的 node.exe：优先 SnowLuma 自带 → 便携版 → 系统 PATH
+// 找可用的 node.exe：优先组件内（extraDir）→ 便携版 → 系统 PATH。
+// 注意：SnowLuma 自带 node 未加入 PATH，不能用于管理器的 npm install，不作为候选
 function findNode(extraDir) {
   const candidates = [];
   if (extraDir) candidates.push(path.join(extraDir, 'node.exe'));
@@ -138,8 +139,6 @@ function detectAllImpl() {
   const qbEntry = qbDir ? path.join(qbDir, 'src', 'bridge.js') : '';
   const qbNodeMods = qbDir ? path.join(qbDir, 'node_modules') : '';
   const qbCfg = qbDir ? path.join(qbDir, 'config.json') : '';
-  const qbNode = findNode(qbDir).path;
-  const qbNodeVer = qbNode ? nodeVersion(qbNode) : '';
   let qbHomeDirHint = '';
   if (qbCfg && exists(qbCfg)) {
     try {
@@ -167,7 +166,9 @@ function detectAllImpl() {
   const dshPort = dshConf.port || 3080;
   const dshLaunch = findDshLaunch(dshDir, dshConf.workspace, dshConf.cliDir);
 
-  const nodeUsed = snowNode || qbNode;
+  // 管理器可用的 node：只认便携版 / 系统 PATH 的 node（SnowLuma 自带 node 未加 PATH，
+  // 不能用于管理器的 npm install；snowNode 仅供 SnowLuma 卡片展示自身运行时信息）
+  const nodeUsed = findNode().path;
   const nodeState = nodeUsed
     ? versionOk(nodeVersion(nodeUsed), 22, 13)
       ? 'ok'
@@ -181,7 +182,7 @@ function detectAllImpl() {
       state: nodeState,
       path: nodeUsed,
       version: nodeUsed ? nodeVersion(nodeUsed) : '',
-      need: '>=22.13（SnowLuma 自带或便携版均可）',
+      need: '>=22.13（便携版或系统 Node 均可）',
     },
     snowluma: {
       state: snowDir && exists(snowEntry) ? 'ok' : snowDir ? 'warn' : 'missing',

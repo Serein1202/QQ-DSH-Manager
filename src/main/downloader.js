@@ -54,6 +54,9 @@ function githubMirrorUrl(url, mirror) {
 // 注意：只能通过 'data' 监听器写入，不能再挂 res.pipe(out)——
 // 早期版本两者并存会把每个 chunk 写两次，文件膨胀 2 倍导致 zip 损坏。
 async function downloadFile(url, destFile, onProgress, opts = {}) {
+  // 目标父目录可能不存在（如首次下载时 tools/ 尚未创建），先建目录，
+  // 否则 createWriteStream 打开 .part 会抛 ENOENT（曾在新电脑上复现）
+  fs.mkdirSync(path.dirname(destFile), { recursive: true });
   const tmp = destFile + '.part';
   let resumeFrom = 0;
   try {

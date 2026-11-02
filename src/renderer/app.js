@@ -42,7 +42,13 @@ function onChan(channel, cb) {
 /* ---------- 视图 1：环境检测 / 安装 ---------- */
 async function renderHome() {
   $content.innerHTML = '';
-  $content.append(el('h1', {}, '环境检测'));
+  const headRow = el('div', { style: 'display:flex;align-items:center;gap:12px' });
+  headRow.append(el('h1', {}, '环境检测'));
+  headRow.append(el('button', { class: 'btn', onclick: async () => {
+    await window.api.invoke('detect:all', { force: true });
+    renderHome();
+  } }, '刷新环境'));
+  $content.append(headRow);
   $content.append(el('p', { class: 'sub' }, '自动检测电脑里的组件；缺什么点什么。安装过程在下方滚动显示。'));
 
   const d = await window.api.invoke('detect:all');
@@ -78,7 +84,7 @@ async function renderHome() {
   }
 
   // Node
-  const nodeCard = card('Node.js 运行时', d.node, [
+  const nodeCard = card('Node.js', d.node, [
     d.node.state !== 'ok'
       ? actBtn('一键下载便携版', true, () => runInstall('node', null))
       : el('span', { class: 'detail' }, `v${d.node.version} · ${d.node.path}`),
