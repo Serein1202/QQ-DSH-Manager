@@ -91,8 +91,3 @@ QQ-DSH-Manager/
 - **SnowLuma / DSH 下载地址**：官网直链未预置（避免写死失效地址），高级设置里填 zip 直链即可启用一键下载；qq-bridge / companion-kit 已预置 gh-proxy 加速的 GitHub 地址。
 - **Node 版本要求**：qq-bridge ≥22.13；SnowLuma 优先用其目录自带的 node.exe。
 
-## About
-
-QQ-DSH-Manager 是一个 Electron 桌面应用，用于一键部署和管理 SnowLuma、DSH、qq-bridge、ai-companion-kit 四个组件。零构建原生 JS 界面，支持 NSIS 安装器与便携版打包，内置自动更新检测（GitHub Releases）。
-
-**版本**: v1.0.4 | **协议**: MIT | **作者**: Serein1202
