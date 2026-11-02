@@ -7,6 +7,7 @@ const os = require('os');
 const crypto = require('crypto');
 const path = require('path');
 const { spawn, spawnSync } = require('child_process');
+const { findNode } = require('./detect');
 
 function fetchRedirect(url, depth = 0, extraHeaders = {}) {
   return new Promise((resolve, reject) => {
@@ -153,26 +154,65 @@ function unzip(zipFile, destDir) {
   return destDir;
 }
 
+// 解析可用的 npm 启动器：显式 nodeDir（便携 node）→ 自动探测 node（便携/系统）→ PATH 里的 npm.cmd
+// 返回 null 表示本机完全没有可用的 Node/npm 环境。
+// 为什么不能直接 spawn npm.cmd：Windows 下 .cmd/.bat 不能被 CreateProcess 直接解释，
+// shell:true 时依赖 PATH 里有 npm.cmd；新电脑没装系统 Node 时会报
+// 「'npm.cmd' 不是内部或外部命令」，因此一律优先 node + npm-cli.js 精确执行。
+function resolveNpmLauncher(nodeDir) {
+  if (nodeDir) {
+    const nodeBin = path.join(nodeDir, 'node.exe');
+    const npmCli = path.join(nodeDir, 'node_modules', 'npm', 'bin', 'npm-cli.js');
+    if (fs.existsSync(nodeBin) && fs.existsSync(npmCli)) {
+      return { mode: 'node', nodeBin, npmCli, envDir: nodeDir };
+    }
+  }
+  const found = findNode();
+  if (found.path) {
+    const dir = path.dirname(found.path);
+    const npmCli = path.join(dir, 'node_modules', 'npm', 'bin', 'npm-cli.js');
+    if (fs.existsSync(npmCli)) {
+      return { mode: 'node', nodeBin: found.path, npmCli, envDir: dir };
+    }
+  }
+  try {
+    const r = spawnSync('where', ['npm.cmd'], { encoding: 'utf8' });
+    if (r.status === 0) {
+      const first = (r.stdout || '').split(/\r?\n/).find(Boolean);
+      if (first && fs.existsSync(first.trim())) {
+        return { mode: 'npmCmd', npmCmd: first.trim(), envDir: path.dirname(first.trim()) };
+      }
+    }
+  } catch {}
+  return null;
+}
+
 // 单次 npm install（registry 由调用方指定）
 function runNpm(cwd, nodeDir, registry) {
   return new Promise((resolve) => {
     const env = { ...process.env };
-    if (nodeDir) env.PATH = nodeDir + path.delimiter + env.PATH;
-    // Windows 下 .cmd/.bat 不能直接被 spawn（CreateProcess 不解释批处理 → ENOENT）。
-    // 有便携 node 时用 node + npm-cli.js 精确执行；没有便携 node 时退回 cmd 包装 npm.cmd。
     const npmArgs = ['install', '--no-audit', '--no-fund', '--registry=' + registry];
+    const launcher = resolveNpmLauncher(nodeDir);
+    if (!launcher) {
+      return resolve({
+        ok: false,
+        envError: true,
+        error:
+          '未找到可用的 Node/npm 环境：请先在「下载」页安装 Node 便携版（默认 npmmirror node-v22.14.0-win-x64.zip），或安装系统 Node.js 并确保 npm 在 PATH 中',
+        log: [],
+      });
+    }
+    if (launcher.envDir) env.PATH = launcher.envDir + path.delimiter + env.PATH;
     let child;
-    if (nodeDir) {
-      const nodeBin = path.join(nodeDir, 'node.exe');
-      const npmCli = path.join(nodeDir, 'node_modules', 'npm', 'bin', 'npm-cli.js');
-      child = spawn(nodeBin, [npmCli, ...npmArgs], {
+    if (launcher.mode === 'node') {
+      child = spawn(launcher.nodeBin, [launcher.npmCli, ...npmArgs], {
         cwd,
         env,
         windowsHide: true,
         shell: false,
       });
     } else {
-      child = spawn('npm.cmd', npmArgs, {
+      child = spawn(launcher.npmCmd, npmArgs, {
         cwd,
         env,
         windowsHide: true,
@@ -200,6 +240,7 @@ async function npmInstall(cwd, nodeDir) {
   for (const registry of registries) {
     last = await runNpm(cwd, nodeDir, registry);
     if (last.ok) return last;
+    if (last.envError) return last; // 环境缺失：换源也无效，直接短路
   }
   return last;
 }
