@@ -1,4 +1,4 @@
-// detect.js — 环境检测：Node / SnowLuma / DSH / qq-bridge / ai-companion-kit
+// detect.js — 环境检测：Node / SnowLuma / DSH / qq-bridge
 'use strict';
 const fs = require('fs');
 const path = require('path');
@@ -167,13 +167,6 @@ function detectAllImpl() {
   const dshPort = dshConf.port || 3080;
   const dshLaunch = findDshLaunch(dshDir, dshConf.workspace, dshConf.cliDir);
 
-  // ---- ai-companion-kit ----
-  const ckDir =
-    componentDir('companionkit', ['ai-companion-kit', 'companion-kit', 'companionkit'], (d) =>
-      isDir(path.join(d, 'node_modules'))
-    ) || componentDir('companionkit', ['ai-companion-kit', 'companion-kit', 'companionkit']);
-  const ckNodeMods = ckDir ? path.join(ckDir, 'node_modules') : '';
-
   const nodeUsed = snowNode || qbNode;
   const nodeState = nodeUsed
     ? versionOk(nodeVersion(nodeUsed), 22, 13)
@@ -236,15 +229,6 @@ function detectAllImpl() {
           : !isDir(qbNodeMods)
             ? '缺 node_modules，点"修复"自动 npm install'
             : '依赖完整',
-    },
-    companionkit: {
-      state: ckDir && isDir(ckNodeMods) ? 'ok' : ckDir ? 'warn' : 'missing',
-      dir: ckDir,
-      detail: !ckDir
-        ? '未找到目录'
-        : isDir(ckNodeMods)
-          ? '依赖完整'
-          : '缺 node_modules，点"修复"自动 npm install',
     },
   };
 }

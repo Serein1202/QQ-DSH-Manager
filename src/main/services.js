@@ -102,22 +102,21 @@ function buildServiceList() {
   }
 
   // qq-bridge（手机 MCP / QQ 空间作为附属服务，随它一起启停，不单独占用卡片）
+  // ai-companion-kit 已整合进 qq-bridge，附属服务统一从 qq-bridge 目录运行
   {
     const node = findNode(d.qqbridge.dir).path || 'node';
-    const ckNode = findNode(d.companionkit.dir).path || node;
-    const ckHas = !!d.companionkit.dir;
     const companions = [];
-    if (ckHas) {
+    if (d.qqbridge.dir) {
       companions.push(
         {
           id: 'qqbridge-phone',
           name: '手机 MCP',
-          run: { cwd: d.companionkit.dir, command: ckNode, args: ['packages/phone-mcp/src/phone-mcp.js'], verify: ['phone-mcp.js'] },
+          run: { cwd: d.qqbridge.dir, command: node, args: ['packages/phone-mcp/src/phone-mcp.js'], verify: ['phone-mcp.js'] },
         },
         {
           id: 'qqbridge-qzone',
           name: 'QQ 空间',
-          run: { cwd: d.companionkit.dir, command: ckNode, args: ['packages/qzone/open-zone.mjs'], verify: ['open-zone.mjs'] },
+          run: { cwd: d.qqbridge.dir, command: node, args: ['packages/qzone/open-zone.mjs'], verify: ['open-zone.mjs'] },
         }
       );
     }

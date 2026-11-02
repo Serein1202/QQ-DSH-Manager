@@ -1,0 +1,92 @@
+name: Build & Release QQ-DSH-Manager
+
+on:
+  push:
+    branches: [main, master]
+    paths-ignore:
+      - '**.md'
+      - '.github/**'
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Compute next version
+        id: version
+        shell: pwsh
+        run: |
+          $repo = "${{ github.repository }}"
+          $headers = @{ Authorization = "token ${{ secrets.GITHUB_TOKEN }}" }
+          $ver = ""
+          try {
+            $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/latest" -Headers $headers
+            if ($rel.tag_name -match 'v?(\d+)\.(\d+)\.(\d+)') {
+              $maj = [int]$Matches[1]; $min = [int]$Matches[2]; $pat = [int]$Matches[3]
+              $ver = "$maj.$min.$($pat + 1)"
+            }
+          } catch {
+            # 首次发布：无 latest release，忽略
+          }
+          if (-not $ver) {
+            $pkg = Get-Content package.json -Raw | ConvertFrom-Json
+            $ver = $pkg.version
+          }
+          "version=$ver" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Write electron-builder config
+        shell: pwsh
+        run: |
+          @"
+          appId: com.qqdsh.manager
+          productName: QQ-DSH-Manager
+          directories:
+            output: release
+          files:
+            - src/**/*
+            - package.json
+          win:
+            target:
+              - target: portable
+                arch: [x64]
+              - target: zip
+                arch: [x64]
+          "@ | Set-Content -Path electron-builder.ci.yml -Encoding utf8
+
+      - name: Build exe & zip
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: npx electron-builder --win --config electron-builder.ci.yml
+
+      - name: Publish Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: QQ-DSH-Manager v${{ steps.version.outputs.version }}
+          name: QQ-DSH-Manager v${{ steps.version.outputs.version }}
+          body: |
+            QQ-DSH-Manager v${{ steps.version.outputs.version }} 自动构建发布。
+
+            - exe：便携版，双击即用
+            - zip：完整解压即用目录
+          files: |
+            release/*.exe
+            release/*.zip
+          draft: false
+          prerelease: false

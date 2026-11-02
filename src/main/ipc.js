@@ -62,9 +62,9 @@ function listOnebotFiles(snowDir) {
 }
 
 // ---------- 主进程侧入参校验（防渲染层被 XSS 后滥用敏感 handler） ----------
-const ALLOW_INSTALL_KEYS = new Set(['node', 'snowluma', 'dsh', 'qqbridge', 'companionkit']);
-const ALLOW_DOWNLOAD_KEYS = new Set(['snowluma', 'dsh', 'qqbridge', 'companionkit', 'node', 'managerUpdate']);
-const ALLOW_RESTART_KEYS = new Set(['snowluma', 'dsh', 'qqbridge', 'companionkit']);
+const ALLOW_INSTALL_KEYS = new Set(['node', 'snowluma', 'dsh', 'qqbridge']);
+const ALLOW_DOWNLOAD_KEYS = new Set(['snowluma', 'dsh', 'qqbridge', 'node']);
+const ALLOW_RESTART_KEYS = new Set(['snowluma', 'dsh', 'qqbridge']);
 
 // settings:set 白名单 schema：未知字段丢弃、类型不符丢弃（number 允许字符串数字）
 const SETTINGS_SCHEMA = {
@@ -74,7 +74,6 @@ const SETTINGS_SCHEMA = {
     snowluma: { dir: 'string' },
     dsh: { dir: 'string', startCommand: 'string', port: 'number', workspace: 'string' },
     qqbridge: { dir: 'string' },
-    companionkit: { dir: 'string' },
   },
   downloads: { keySet: ALLOW_DOWNLOAD_KEYS, type: 'stringMap' },
   autoRestart: { keySet: ALLOW_RESTART_KEYS, type: 'booleanMap' },
@@ -178,7 +177,7 @@ async function installComponent(key, targetDir, onStep) {
   unzip(tmpZip, targetDir);
   fs.unlinkSync(tmpZip);
 
-  if (key === 'qqbridge' || key === 'companionkit') {
+  if (key === 'qqbridge') {
     step('安装依赖（npm install，可能要几分钟）…');
     const nodeDir = path.join(defaultScanRoot(), 'tools', '_runtime', 'node');
     const nodeExe = path.join(nodeDir, 'node.exe');
@@ -272,7 +271,11 @@ function registerIpc() {
   ipcMain.handle('svc:restart', async (_e, id) => {
     const svc = buildServiceList().find((x) => x.id === id);
     for (const c of (svc && svc.companions) || []) pm.stop(c.id);
-    pm.stop(id, svc ? svc.probePorts : [], svc ? svc.run.cwd : '');
+    // 不再无条件信任 stop 结果：停止失败直接中止重启，禁止继续 start，避免叠加新实例
+    const stopR = pm.stop(id, svc ? svc.probePorts : [], svc ? svc.run.cwd : '', { verify: (svc && svc.run.verify) || [] });
+    if (!stopR.ok) {
+      return { ok: false, error: `停止失败，已中止重启：${stopR.error || '未知错误'}` };
+    }
     // 等端口真正释放（DSH 这类 GUI 程序退出较慢，固定 1.2s 常常没退干净就重启 → 抢端口失败）
     const ports = (svc && svc.probePorts) || [];
     const deadline = Date.now() + 10000;
@@ -282,6 +285,11 @@ function registerIpc() {
       await new Promise((r) => setTimeout(r, 400));
     }
     if (!svc || !svc.startable) return { ok: false, error: (svc && svc.blockedReason) || '无法启动' };
+    // 等端口释放循环超时后端口仍被占用：旧实例未退净，直接启动会再叠加实例，报错中止
+    const stillUp = await Promise.all(ports.map((p) => probePort(p, '127.0.0.1', 400)));
+    if (ports.length && stillUp.some(Boolean)) {
+      return { ok: false, error: `端口 ${ports.join('/')} 在停止后仍未释放，已中止重启以避免残留多实例` };
+    }
     const r = pm.start(id, svc.run);
     for (const c of svc.companions || []) pm.start(c.id, { ...c.run, logTo: id, logPrefix: c.name });
     return r;
@@ -295,6 +303,14 @@ function registerIpc() {
       if (!svc || !svc.startable || pm.isRunning(id)) {
         results.push({ id, ok: false, skipped: true, reason: svc ? svc.blockedReason : '未知' });
         continue;
+      }
+      // 不只看内存托管表：端口已在监听 = 已有实例在跑（残留/外部启动），复用而非再拉新实例
+      if (svc.probePorts.length) {
+        const ups = await Promise.all(svc.probePorts.map((p) => probePort(p)));
+        if (ups.some(Boolean)) {
+          results.push({ id, ok: true, reused: true, message: `${svc.name} 已在运行（端口 ${svc.probePorts.join('/')} 在监听），已复用现有进程` });
+          continue;
+        }
       }
       const r = pm.start(id, svc.run);
       // 附属服务跟随主服务启动
@@ -460,24 +476,41 @@ function registerIpc() {
   ipcMain.handle('app:version', () => app.getVersion());
 
   // ---------- 自更新 ----------
-  // 更新清单 JSON：{"version":"1.0.1","installer":"exe直链","portable":"exe直链","page":"网页","notes":"说明"}
+  // 更新来源固定为 GitHub Releases（release.yml 在 push 时自动构建发布，tag 形如 "QQ-DSH-Manager vX.X.X"），
+  // 不再需要手动填写更新清单地址。
+  const MANAGER_RELEASE_API = 'https://api.github.com/repos/Serein1202/QQ-DSH-Manager/releases/latest';
+
+  // 拉取 latest release 并解析出版本号与安装包资产
+  async function fetchManagerRelease() {
+    const m = await fetchJson(MANAGER_RELEASE_API);
+    const tag = String(m.tag_name || '');
+    const ver = (tag.match(/(\d+)\.(\d+)\.(\d+)/) || []).slice(1, 4).join('.');
+    const assets = (m.assets || []).map((a) => ({ name: a.name || '', url: a.browser_download_url || '' }));
+    const find = (re) => { const a = assets.find((x) => re.test(x.name)); return a ? a.url : ''; };
+    return {
+      version: ver,
+      installer: find(/\.exe$/i),
+      portable: find(/\.zip$/i),
+      page: m.html_url || '',
+      notes: m.body || '',
+    };
+  }
+
   ipcMain.handle('update:check', async () => {
-    const url = settings().downloads.managerUpdate;
-    if (!url) return { configured: false };
     try {
-      const m = await fetchJson(url);
+      const rel = await fetchManagerRelease();
       const current = app.getVersion();
-      const latest = String(m.version || '');
+      const latest = rel.version;
       return {
         configured: true,
         ok: true,
         current,
         latest,
         newer: cmpVer(latest, current) > 0,
-        installer: m.installer || '',
-        portable: m.portable || '',
-        page: m.page || '',
-        notes: m.notes || '',
+        installer: rel.installer,
+        portable: rel.portable,
+        page: rel.page,
+        notes: rel.notes,
       };
     } catch (e) {
       return { configured: true, ok: false, error: e.message };
@@ -485,13 +518,12 @@ function registerIpc() {
   });
 
   // 下载新版安装包到临时目录，下载完自动运行（NSIS 安装器会自己接管）
-  // 收紧：仅允许从配置的 managerUpdate 清单地址下载、扩展名必须是 .exe、打开前弹确认
+  // 收紧：仅允许下载当前 latest release 的资产，扩展名必须是 .exe，打开前弹确认
   ipcMain.handle('update:install', async (_e, { url }) => {
     try {
-      const manifest = settings().downloads.managerUpdate;
-      if (!manifest || !/^https?:\/\//.test(manifest)) return { ok: false, error: '未配置更新清单地址' };
-      if (!url || !/^https?:\/\//.test(url)) return { ok: false, error: '无效的下载地址' };
-      // 只允许清单同源的 exe 直链（防止任意 URL 下载执行）
+      const rel = await fetchManagerRelease();
+      const allowed = [rel.installer, rel.portable].filter(Boolean);
+      if (!url || !allowed.includes(url)) return { ok: false, error: '仅允许下载官方 Release 资产' };
       let destPath = '';
       try {
         destPath = new URL(url).pathname;

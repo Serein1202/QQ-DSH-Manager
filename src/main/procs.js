@@ -296,9 +296,14 @@ class ProcessManager {
       this.userStopped.add(id); // 主动停止：exit 时不触发崩溃自动重启
       try {
         const r = spawnSync('taskkill', ['/PID', String(p.pid), '/T', '/F'], { encoding: 'utf8', timeout: 8000 });
-        this.procs.delete(id);
-        this.pushLog(id, `[${new Date().toLocaleTimeString()}] 已停止`);
-        return { ok: r.status === 0, error: r.status !== 0 ? (r.stderr || '').trim() : '' };
+        if (r.status === 0) {
+          this.procs.delete(id);
+          this.pushLog(id, `[${new Date().toLocaleTimeString()}] 已停止`);
+          return { ok: true };
+        }
+        // taskkill 失败：保留托管记录（isRunning 仍为 true），避免后续 start/restart 叠加新实例
+        this.userStopped.delete(id);
+        return { ok: false, error: (r.stderr || '').trim() || `taskkill 失败 (status=${r.status})` };
       } catch (e) {
         this.userStopped.delete(id);
         return { ok: false, error: e.message };
@@ -307,22 +312,42 @@ class ProcessManager {
 
     // 非托管分支：端口反查 → 命令行兜底
     if ((!ports || !ports.length) && !cwd) return { ok: false, error: '服务未在运行' };
-    const pids = new Set();
+    const portPids = new Set();
     for (const port of ports || []) {
-      for (const pid of pidsByPort(port)) pids.add(pid);
+      for (const pid of pidsByPort(port)) portPids.add(pid);
     }
-    if (!pids.size && cwd) {
-      for (const pid of pidsByCmdline(cwd)) pids.add(pid);
+    // 命令行兜底：不止 cwd，还按 verify 特征（可执行文件完整路径 / 入口文件名）枚举，
+    // 覆盖回退到备用端口、未被 probePorts 反查到的实例
+    const cmdPids = new Set();
+    const needles = [cwd, ...((opts && opts.verify) || [])].filter(Boolean);
+    for (const n of needles) {
+      for (const pid of pidsByCmdline(n)) cmdPids.add(pid);
     }
+    const pids = new Set([...portPids, ...cmdPids]);
     if (!pids.size) return { ok: false, error: '服务未在运行' };
 
-    // 防误杀：只杀身份能确认的进程。端口可能被无关程序占用，仅凭"在监听"不能断定是本服务。
-    // 服务的 run.verify 是启动命令特征（如 index.mjs / bridge.js / --expose-internals），
-    // 命令行命中特征才算；查不到命令行的 PID 直接放过（宁可停不掉，也不误杀）。
+    // 防误杀与防漏杀的平衡：
+    // - 端口命中的 PID：端口是服务自己的 probePorts，命中即视为本服务；命令行反查失败（权限/僵尸）
+    //   或反查为空时不放过，直接纳入停止，避免停不掉旧实例；若命令行可反查到且明确不含 verify
+    //   特征，则视为无关进程放过。
+    // - 命令行兜底命中的 PID：特征较宽泛，仍需 verify 确认身份才杀。
     const verify = (opts && opts.verify) || [];
-    const targets = pidsInfo([...pids]).filter(
-      (info) => info.cmdline && verify.length && verify.some((v) => v && info.cmdline.includes(v))
-    );
+    const infoMap = new Map(pidsInfo([...pids]).map((i) => [i.pid, i.cmdline]));
+    const targets = [];
+    for (const pid of portPids) {
+      const cmd = infoMap.get(pid);
+      if (cmd === undefined || cmd === '') {
+        targets.push({ pid }); // 端口命中但反查不到命令行：信任端口归属，避免漏杀
+      } else if (verify.length && verify.some((v) => v && cmd.includes(v))) {
+        targets.push({ pid });
+      }
+      // 端口命中但命令行明确不含 verify 特征：视为无关进程占用端口，放过（防误杀）
+    }
+    for (const pid of cmdPids) {
+      if (portPids.has(pid)) continue; // 已在端口命中分支处理
+      const cmd = infoMap.get(pid);
+      if (cmd && verify.length && verify.some((v) => v && cmd.includes(v))) targets.push({ pid });
+    }
     if (!targets.length) return { ok: false, error: '端口有进程但无法确认是本服务（已取消停止以避免误杀）' };
 
     const errors = [];

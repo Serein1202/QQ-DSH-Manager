@@ -9,13 +9,8 @@ const path = require('path');
 const DEFAULT_DOWNLOADS = {
   snowluma: 'https://github.com/SnowLuma/SnowLuma/releases',
   dsh: 'https://www.deepseek.com/harness/',
-  qqbridge:
-    'https://gh-proxy.com/https://github.com/Derpyu520/qq-bridge/archive/refs/heads/main.zip',
-  companionkit:
-    'https://gh-proxy.com/https://github.com/pinganbbOvO/ai-companion-kit/archive/refs/heads/main.zip',
+  qqbridge: 'https://github.com/Serein1202/qq-bridge/archive/refs/heads/main.zip',
   node: 'https://npmmirror.com/mirrors/node/v22.14.0/node-v22.14.0-win-x64.zip',
-  // 管理器自身更新清单：JSON {"version":"1.0.1","installer":"exe直链","portable":"exe直链","page":"网页","notes":"说明"}
-  managerUpdate: '',
 };
 
 const DEFAULT_SETTINGS = {
@@ -24,7 +19,6 @@ const DEFAULT_SETTINGS = {
     snowluma: { dir: '' },
     dsh: { dir: '', startCommand: '', port: 3080, workspace: '' },
     qqbridge: { dir: '' },
-    companionkit: { dir: '' },
   },
   downloads: { ...DEFAULT_DOWNLOADS },
   // 扫描根目录：packaged 模式默认 exe 所在目录；dev 模式默认项目上两级
@@ -32,7 +26,7 @@ const DEFAULT_SETTINGS = {
   // 关闭软件时是否停掉所有由本软件拉起的服务
   closeStopServices: false,
   // 子进程崩溃后是否自动重启（每服务可覆盖）
-  autoRestart: { snowluma: false, dsh: false, qqbridge: false, companionkit: false },
+  autoRestart: { snowluma: false, dsh: false, qqbridge: false },
 };
 
 function settingsFile() {

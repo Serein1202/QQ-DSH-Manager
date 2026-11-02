@@ -115,16 +115,6 @@ async function renderHome() {
     d.qqbridge.dir ? actBtn('打开目录', false, () => window.api.invoke('shell:openPath', d.qqbridge.dir)) : null,
   ]);
 
-  // companion-kit
-  const ckActions = [];
-  if (d.companionkit.state === 'missing') ckActions.push(actBtn('一键下载安装', true, () => runInstall('companionkit', null)));
-  if (d.companionkit.state === 'warn') ckActions.push(actBtn('修复（npm install）', true, () => fixNpm(d.companionkit.dir)));
-  const ckCard = card('ai-companion-kit（记忆 / 手机 MCP / 空间）', d.companionkit, [
-    ...ckActions,
-    specDirBtn('companionkit'),
-    d.companionkit.dir ? actBtn('打开目录', false, () => window.api.invoke('shell:openPath', d.companionkit.dir)) : null,
-  ]);
-
   function runInstall(key, targetDir) {
     installBox.textContent += `\n[开始] ${key}\n`;
     window.api.invoke('dl:install', { key, targetDir }).then((r) => {
@@ -158,7 +148,6 @@ async function renderHome() {
     snowCard,
     dshCard,
     qbCard,
-    ckCard,
     el('div', { class: 'card' }, el('h3', {}, '安装日志'), installBox),
     el('p', { class: 'sub' }, `自动扫描目录：${(d.scanRoots || [d.scanRoot]).join('　')}（可在高级设置里更改）`)
   );
@@ -270,8 +259,20 @@ async function renderServices() {
     if (!logFor) logBox.style.display = 'none';
     else showLog(id);
   }
+  const svcOpKeys = new Set(); // 操作互斥：进行中的服务操作 (channel|id)，防止快速连点并发重复 spawn
   async function doSvc(channel, id) {
-    const r = await window.api.invoke(channel, id);
+    const key = channel + '|' + id;
+    if (svcOpKeys.has(key)) {
+      toast('该操作正在执行中，请稍候', true);
+      return;
+    }
+    svcOpKeys.add(key);
+    let r = null;
+    try {
+      r = await window.api.invoke(channel, id);
+    } finally {
+      svcOpKeys.delete(key);
+    }
     if (!r.ok && r.error) toast(r.error, true);
     else if (r.reused && r.message) toast(r.message);
     // 附属服务启动失败单独提示（主服务仍然成功时不打断）
@@ -447,7 +448,6 @@ async function renderSettings() {
   cardComp.append(dirField('snowluma', 'SnowLuma 目录', s.components.snowluma?.dir));
   cardComp.append(dirField('dsh', 'DSH 目录', s.components.dsh?.dir));
   cardComp.append(dirField('qqbridge', 'qq-bridge 目录', s.components.qqbridge?.dir));
-  cardComp.append(dirField('companionkit', 'ai-companion-kit 目录', s.components.companionkit?.dir));
 
   const dshCmd = el('input', { type: 'text', value: s.components.dsh?.startCommand || '', placeholder: '留空 = 自动用 DSH 自带 CLI 跑 dsh web（3080 端口）' });
   const dshPort = el('input', { type: 'number', value: s.components.dsh?.port || 3080 });
@@ -463,10 +463,8 @@ async function renderSettings() {
   for (const [key, label] of [
     ['snowluma', 'SnowLuma（官网/zip 直链）'],
     ['dsh', 'DSH（官网/zip 直链）'],
-    ['qqbridge', 'qq-bridge（GitHub zip，已配 gh-proxy 加速）'],
-    ['companionkit', 'ai-companion-kit（GitHub zip）'],
+    ['qqbridge', 'qq-bridge（GitHub zip）'],
     ['node', 'Node 便携版（zip）'],
-    ['managerUpdate', '管理器更新清单（JSON：{"version","installer","portable","page","notes"}）'],
   ]) {
     const input = el('input', { type: 'text', value: s.downloads?.[key] || '', placeholder: 'zip 直链 = 自动下载解压；网页地址 = 打开浏览器' });
     dlInputs[key] = input;
@@ -485,7 +483,6 @@ async function renderSettings() {
         snowluma: { dir: dirInputs.snowluma.value.trim() },
         dsh: { dir: dirInputs.dsh.value.trim(), startCommand: dshCmd.value.trim(), port: Number(dshPort.value) || 3080, workspace: dshWs.value.trim() },
         qqbridge: { dir: dirInputs.qqbridge.value.trim() },
-        companionkit: { dir: dirInputs.companionkit.value.trim() },
       },
       downloads: Object.fromEntries(Object.entries(dlInputs).map(([k, i]) => [k, i.value.trim()])),
       closeStopServices: chkClose.checked,
@@ -501,10 +498,6 @@ async function checkUpdate() {
   btn.textContent = '检查中…';
   try {
     const r = await window.api.invoke('update:check');
-    if (!r.configured) {
-      toast('未配置更新链接（高级设置 → 下载地址 → 管理器更新清单）', true);
-      return;
-    }
     if (!r.ok) {
       toast('检查更新失败：' + r.error, true);
       return;
