@@ -134,10 +134,19 @@ async function renderHome() {
     installBox.scrollTop = installBox.scrollHeight;
   });
   onChan('dl:progress', ({ key, received, total }) => {
+    if (key === 'update') {
+      const pct = total ? Math.min(100, Math.round((received / total) * 100)) : null;
+      setUpdateProgress(pct, `${(received / 1048576).toFixed(1)} MB / ${total ? (total / 1048576).toFixed(1) + ' MB' : '?'}`);
+      return;
+    }
     installBox.textContent += `[${key}] 进度 ${(received / 1048576).toFixed(1)}MB / ${total ? (total / 1048576).toFixed(1) + 'MB' : '?'}\n`;
     installBox.scrollTop = installBox.scrollHeight;
   });
   onChan('dl:done', ({ key, ok, error }) => {
+    if (key === 'update') {
+      hideUpdateProgress();
+      return;
+    }
     installBox.textContent += `[${key}] ${ok ? '✅ 完成' : '❌ ' + (error || '失败')}\n`;
     installBox.scrollTop = installBox.scrollHeight;
     if (ok && currentView === 'home') renderHome();
@@ -476,6 +485,10 @@ async function renderSettings() {
   chkClose.checked = !!s.closeStopServices;
   cardMisc.append(el('label', { class: 'check' }, chkClose, '关闭软件时停止所有由管理器启动的服务'));
 
+  // GitHub 加速镜像：留空=官方直连（失败自动走内置镜像兜底）
+  const ghMirror = el('input', { type: 'text', value: s.githubMirror || '', placeholder: '留空=直连（失败自动走内置镜像）；如 https://ghfast.top' });
+  cardMisc.append(el('div', { class: 'field' }, el('label', {}, 'GitHub 加速镜像（检查更新/下载用）'), ghMirror));
+
   $content.append(cardComp, cardDl, cardMisc);
   $content.append(el('button', { class: 'btn primary', onclick: async () => {
     await window.api.invoke('settings:set', {
@@ -486,12 +499,26 @@ async function renderSettings() {
       },
       downloads: Object.fromEntries(Object.entries(dlInputs).map(([k, i]) => [k, i.value.trim()])),
       closeStopServices: chkClose.checked,
+      githubMirror: ghMirror.value.trim(),
     });
     toast('设置已保存');
   } }, '💾 保存设置'));
 }
 
 /* ---------- 侧栏底部：版本 + 检查更新 ---------- */
+function setUpdateProgress(pct, text) {
+  const wrap = document.getElementById('update-progress');
+  if (!wrap) return;
+  wrap.style.display = 'block';
+  const fill = document.getElementById('update-progress-fill');
+  const label = document.getElementById('update-progress-label');
+  if (fill && pct != null) fill.style.width = pct + '%';
+  if (label) label.textContent = (pct != null ? `${pct}%　` : '') + (text || '');
+}
+function hideUpdateProgress() {
+  const wrap = document.getElementById('update-progress');
+  if (wrap) wrap.style.display = 'none';
+}
 async function checkUpdate() {
   const btn = document.getElementById('btn-update');
   btn.disabled = true;
@@ -526,8 +553,12 @@ async function checkUpdate() {
 (function initFoot() {
   const status = el('div', { id: 'foot-status' }, '…');
   const btn = el('button', { id: 'btn-update', class: 'btn', style: 'margin-top:8px;width:100%;font-size:12px', onclick: checkUpdate }, '检查更新');
+  const upWrap = el('div', { id: 'update-progress', style: 'display:none;margin-top:8px' },
+    el('div', { class: 'progress' }, el('div', { id: 'update-progress-fill' })),
+    el('div', { id: 'update-progress-label', style: 'margin-top:2px;font-size:11px;color:var(--muted)' })
+  );
   const ver = el('div', { style: 'margin-top:6px;font-size:11px;color:var(--muted)' });
-  $foot.append(status, btn, ver);
+  $foot.append(status, btn, upWrap, ver);
   window.api.invoke('app:version').then((v) => (ver.textContent = 'v' + v));
 })();
 

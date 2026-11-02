@@ -8,17 +8,17 @@ const crypto = require('crypto');
 const path = require('path');
 const { spawn, spawnSync } = require('child_process');
 
-function fetchRedirect(url, depth = 0) {
+function fetchRedirect(url, depth = 0, extraHeaders = {}) {
   return new Promise((resolve, reject) => {
     if (depth > 5) return reject(new Error('重定向次数过多'));
     const mod = url.startsWith('https:') ? https : http;
-    const req = mod.get(url, { headers: { 'User-Agent': 'QQ-DSH-Manager/1.0' } }, (res) => {
+    const req = mod.get(url, { headers: { 'User-Agent': 'QQ-DSH-Manager/1.0', ...extraHeaders } }, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         res.resume();
         const next = new URL(res.headers.location, url).toString();
-        return resolve(fetchRedirect(next, depth + 1));
+        return resolve(fetchRedirect(next, depth + 1, extraHeaders));
       }
-      if (res.statusCode !== 200) {
+      if (res.statusCode < 200 || res.statusCode >= 300) {
         res.resume();
         return reject(new Error(`HTTP ${res.statusCode}`));
       }
@@ -29,54 +29,105 @@ function fetchRedirect(url, depth = 0) {
   });
 }
 
-// 下载到 destFile，onProgress(received, total) 每 ~2% 上报一次。
-// opts.verifyZip = true 时校验 zip 魔数（PK\x03\x04）与 content-length 一致性，失败清理 .part。
+// GitHub 加速镜像列表（按稳定性排序，仅作直连失败的兜底；均支持标准前缀拼 URL）
+const GITHUB_MIRRORS = [
+  'https://ghfast.top',
+  'https://gh-proxy.com',
+  'https://ghproxy.net',
+  'https://mirror.ghproxy.com',
+];
+
+// 若配置了镜像前缀，给 GitHub 官方 URL 加前缀；留空则原样返回（直连）
+function githubMirrorUrl(url, mirror) {
+  const m = String(mirror || '').trim().replace(/\/+$/, '');
+  if (!m) return url;
+  return m + '/' + url;
+}
+
+// 下载到 destFile，onProgress(received, total) 每 ~2% 上报一次。支持断点续传：
+// - 若 destFile.part 已存在且有字节，自动带 Range 头续传（服务端返回 206 则追加写入）；
+// - 服务端不支持 Range（200）或 Range 无效（416）时自动从头下载；
+// - 网络中断/超时等错误保留 .part，下次调用同一 destFile 可从断点继续；
+// - opts.verifyZip = true 时校验 zip 魔数（PK\x03\x04）与 content-length 一致性，
+//   失败会清空 .part 从头完整重下一遍，仍失败才抛错。
 // 注意：只能通过 'data' 监听器写入，不能再挂 res.pipe(out)——
 // 早期版本两者并存会把每个 chunk 写两次，文件膨胀 2 倍导致 zip 损坏。
 async function downloadFile(url, destFile, onProgress, opts = {}) {
-  const res = await fetchRedirect(url);
-  const total = Number(res.headers['content-length']) || 0;
   const tmp = destFile + '.part';
-  const out = fs.createWriteStream(tmp);
-  let received = 0;
-  let lastPct = -1;
+  let resumeFrom = 0;
   try {
-    await new Promise((resolve, reject) => {
-      res.on('data', (chunk) => {
-        received += chunk.length;
-        out.write(chunk);
-        if (onProgress && total) {
-          const pct = Math.floor((received / total) * 100);
-          if (pct >= lastPct + 2 || pct === 100) {
-            lastPct = pct;
-            onProgress(received, total);
+    if (fs.existsSync(tmp)) {
+      const st = fs.statSync(tmp);
+      if (st.size > 0) resumeFrom = st.size;
+    }
+  } catch { /* stat 失败忽略，从头下载 */ }
+
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const headers = {};
+    if (resumeFrom > 0) headers.Range = `bytes=${resumeFrom}-`;
+    let res;
+    try {
+      res = await fetchRedirect(url, 0, headers);
+    } catch (e) {
+      if (String(e.message).startsWith('HTTP 416')) {
+        // Range 超出/无效：本地 part 与服务器不一致，清掉从头下
+        resumeFrom = 0;
+        fs.rmSync(tmp, { force: true });
+        continue;
+      }
+      throw e; // 网络错误：保留 .part 供下次续传
+    }
+    const total = (resumeFrom || 0) + (Number(res.headers['content-length']) || 0);
+    const out = fs.createWriteStream(tmp, resumeFrom > 0 && res.statusCode === 206 ? { flags: 'a' } : { flags: 'w' });
+    let received = resumeFrom;
+    let lastPct = -1;
+    try {
+      await new Promise((resolve, reject) => {
+        res.on('data', (chunk) => {
+          received += chunk.length;
+          out.write(chunk);
+          if (onProgress && total) {
+            const pct = Math.floor((received / total) * 100);
+            if (pct >= lastPct + 2 || pct === 100) {
+              lastPct = pct;
+              onProgress(received, total);
+            }
           }
-        }
+        });
+        res.on('end', () => out.end()); // 流读完显式结束写流（去掉 pipe 后需手动 end）
+        res.on('error', reject);
+        out.on('error', reject);
+        out.on('finish', resolve);
       });
-      res.on('end', () => out.end()); // 流读完显式结束写流（去掉 pipe 后需手动 end）
-      res.on('error', reject);
-      out.on('error', reject);
-      out.on('finish', resolve);
-    });
+    } catch (e) {
+      out.destroy(); // 网络中断：保留 .part，供下次续传
+      throw e;
+    }
     // 完整性校验：zip 魔数 + 大小一致（仅当调用方要求）
     if (opts.verifyZip) {
-      const head = Buffer.alloc(4);
-      const fd = fs.openSync(tmp, 'r');
-      fs.readSync(fd, head, 0, 4, 0);
-      fs.closeSync(fd);
-      if (!head.equals(Buffer.from([0x50, 0x4b, 0x03, 0x04]))) {
-        throw new Error('下载内容不是有效的 zip 包（魔数校验失败）');
-      }
-      if (total && received !== total) {
-        throw new Error(`下载不完整（${received}/${total} 字节）`);
+      let bad = false;
+      try {
+        const head = Buffer.alloc(4);
+        const fd = fs.openSync(tmp, 'r');
+        fs.readSync(fd, head, 0, 4, 0);
+        fs.closeSync(fd);
+        if (!head.equals(Buffer.from([0x50, 0x4b, 0x03, 0x04]))) bad = true;
+        if (total && received !== total) bad = true;
+      } catch { bad = true; }
+      if (bad) {
+        if (attempt < 2) {
+          // 可能续传到了过期/损坏数据：清空 part 从头完整重下
+          resumeFrom = 0;
+          fs.rmSync(tmp, { force: true });
+          continue;
+        }
+        throw new Error('下载内容校验失败（zip 魔数或大小不一致）');
       }
     }
     fs.renameSync(tmp, destFile);
-  } catch (e) {
-    fs.rmSync(tmp, { force: true }); // 失败清理 .part，避免残留
-    throw e;
+    return destFile;
   }
-  return destFile;
+  throw new Error('下载失败：重试次数用尽');
 }
 
 // 用 PowerShell Expand-Archive 解压（Windows 自带，免第三方依赖）
@@ -161,4 +212,4 @@ async function fetchJson(url) {
   return JSON.parse(data);
 }
 
-module.exports = { downloadFile, unzip, npmInstall, fetchRedirect, fetchJson };
+module.exports = { downloadFile, unzip, npmInstall, fetchRedirect, fetchJson, GITHUB_MIRRORS, githubMirrorUrl };

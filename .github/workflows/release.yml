@@ -51,6 +51,10 @@ jobs:
           }
           "version=$ver" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
+      - name: Sync version to package.json
+        shell: pwsh
+        run: npm version ${{ steps.version.outputs.version }} --no-git-tag-version
+
       - name: Write electron-builder config
         shell: pwsh
         run: |

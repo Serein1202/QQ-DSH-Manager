@@ -27,6 +27,8 @@ const DEFAULT_SETTINGS = {
   closeStopServices: false,
   // 子进程崩溃后是否自动重启（每服务可覆盖）
   autoRestart: { snowluma: false, dsh: false, qqbridge: false },
+  // GitHub 加速镜像前缀（留空=官方直连，失败自动走内置镜像兜底；如 https://ghfast.top）
+  githubMirror: '',
 };
 
 function settingsFile() {

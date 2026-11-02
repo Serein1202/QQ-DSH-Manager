@@ -9,7 +9,7 @@ const { settings, updateSettings, defaultScanRoot, scanRoots } = require('./stor
 const { detectAll, invalidateDetect, findNode } = require('./detect');
 const { ProcessManager, probePort } = require('./procs');
 const { buildServiceList, START_ORDER } = require('./services');
-const { downloadFile, unzip, npmInstall, fetchJson } = require('./downloader');
+const { downloadFile, unzip, npmInstall, fetchJson, GITHUB_MIRRORS, githubMirrorUrl } = require('./downloader');
 
 const pm = new ProcessManager();
 const downloads = new Map(); // key -> { running: true } 防重复下载
@@ -77,6 +77,7 @@ const SETTINGS_SCHEMA = {
   },
   downloads: { keySet: ALLOW_DOWNLOAD_KEYS, type: 'stringMap' },
   autoRestart: { keySet: ALLOW_RESTART_KEYS, type: 'booleanMap' },
+  githubMirror: 'string',
 };
 
 function sanitizeBySchema(value, schema) {
@@ -505,20 +506,42 @@ function registerIpc() {
   // 不再需要手动填写更新清单地址。
   const MANAGER_RELEASE_API = 'https://api.github.com/repos/Serein1202/QQ-DSH-Manager/releases/latest';
 
-  // 拉取 latest release 并解析出版本号与安装包资产
+  // GitHub 加速候选：配置了镜像前缀只走镜像；未配置先直连官方，失败自动换内置镜像兜底
+  function releaseApiCandidates() {
+    const mirror = (settings().githubMirror || '').trim().replace(/\/+$/, '');
+    if (mirror) return [mirror + '/' + MANAGER_RELEASE_API];
+    return [MANAGER_RELEASE_API, ...GITHUB_MIRRORS.map((m) => m + '/' + MANAGER_RELEASE_API)];
+  }
+
+  // 下载 URL 候选（同样规则）：配置镜像只用镜像；否则官方直连失败自动走镜像兜底
+  function githubDlCandidates(url) {
+    const mirror = (settings().githubMirror || '').trim().replace(/\/+$/, '');
+    if (mirror) return [githubMirrorUrl(url, mirror)];
+    return [url, ...GITHUB_MIRRORS.map((m) => githubMirrorUrl(url, m))];
+  }
+
+  // 拉取 latest release 并解析出版本号与安装包资产（逐个候选源尝试，全失败才抛错）
   async function fetchManagerRelease() {
-    const m = await fetchJson(MANAGER_RELEASE_API);
-    const tag = String(m.tag_name || '');
-    const ver = (tag.match(/(\d+)\.(\d+)\.(\d+)/) || []).slice(1, 4).join('.');
-    const assets = (m.assets || []).map((a) => ({ name: a.name || '', url: a.browser_download_url || '' }));
-    const find = (re) => { const a = assets.find((x) => re.test(x.name)); return a ? a.url : ''; };
-    return {
-      version: ver,
-      installer: find(/\.exe$/i),
-      portable: find(/\.zip$/i),
-      page: m.html_url || '',
-      notes: m.body || '',
-    };
+    let lastErr = null;
+    for (const apiUrl of releaseApiCandidates()) {
+      try {
+        const m = await fetchJson(apiUrl);
+        const tag = String(m.tag_name || '');
+        const ver = (tag.match(/(\d+)\.(\d+)\.(\d+)/) || []).slice(1, 4).join('.');
+        const assets = (m.assets || []).map((a) => ({ name: a.name || '', url: a.browser_download_url || '' }));
+        const find = (re) => { const a = assets.find((x) => re.test(x.name)); return a ? a.url : ''; };
+        return {
+          version: ver,
+          installer: find(/\.exe$/i),
+          portable: find(/\.zip$/i),
+          page: m.html_url || '',
+          notes: m.body || '',
+        };
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+    throw lastErr || new Error('获取最新版本失败');
   }
 
   ipcMain.handle('update:check', async () => {
@@ -567,7 +590,18 @@ function registerIpc() {
       if (ans.response !== 0) return { ok: false, error: '已取消更新' };
       const name = path.basename(destPath) || 'update-installer.exe';
       const dest = path.join(os.tmpdir(), 'cm-update-' + name);
-      await downloadFile(url, dest, (r, t) => send('dl:progress', { key: 'update', received: r, total: t }));
+      // 多源回退：直连失败自动切镜像；网络中断时 .part 保留，换源后从断点继续
+      let lastErr = null;
+      for (const dlUrl of githubDlCandidates(url)) {
+        try {
+          await downloadFile(dlUrl, dest, (r, t) => send('dl:progress', { key: 'update', received: r, total: t }));
+          lastErr = null;
+          break;
+        } catch (e) {
+          lastErr = e;
+        }
+      }
+      if (lastErr) throw lastErr;
       const err = shell.openPath(dest);
       if (err) return { ok: false, error: err };
       return { ok: true, file: dest };
