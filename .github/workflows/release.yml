@@ -78,7 +78,7 @@ jobs:
       - name: Publish Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: QQ-DSH-Manager v${{ steps.version.outputs.version }}
+          tag_name: QQ-DSH-Manager-v${{ steps.version.outputs.version }}
           name: QQ-DSH-Manager v${{ steps.version.outputs.version }}
           body: |
             QQ-DSH-Manager v${{ steps.version.outputs.version }} 自动构建发布。
