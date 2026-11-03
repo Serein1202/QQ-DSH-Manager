@@ -14,6 +14,36 @@ const { downloadFile, unzip, npmInstall, fetchJson, GITHUB_MIRRORS, githubMirror
 const pm = new ProcessManager();
 const downloads = new Map(); // key -> { running: true } 防重复下载
 
+// 等一组端口至少有一个就绪：就绪返回空串，超时返回提示文案。
+// 为什么要等：spawn 只代表进程创建成功，服务真正可用要等它监听端口。
+// 不等就返回 ok，前端 1.5s 刷新时看到「未运行」，用户会认为启动/重启失败。
+async function waitReady(ports, timeout = 15000) {
+  const list = (ports || []).filter(Boolean);
+  if (!list.length) return '';
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    const ups = await Promise.all(list.map((p) => probePort(p, '127.0.0.1', 500)));
+    if (ups.some(Boolean)) return '';
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  return `进程已启动，但端口 ${list.join('/')} 在 ${Math.round(timeout / 1000)}s 内未就绪（可能仍在初始化，或需要登录/授权）`;
+}
+
+// 停止全部服务（含用户手动启动、未被托管的实例，靠端口 + 身份特征反查）。
+// sync=true：只同步下达 taskkill、不等待退出，供 before-quit 这类同步钩子使用。
+function stopAllServices(sync = false) {
+  const portsById = {};
+  const cwdById = {};
+  const optsById = {};
+  for (const svc of buildServiceList()) {
+    portsById[svc.id] = svc.probePorts;
+    cwdById[svc.id] = svc.run.cwd || '';
+    optsById[svc.id] = { verify: svc.run.verify || [] };
+  }
+  if (sync) return pm.stopAllSync(portsById, cwdById, optsById).stopped;
+  return pm.stopAll(portsById, cwdById, optsById);
+}
+
 function send(channel, payload) {
   for (const w of BrowserWindow.getAllWindows()) {
     if (!w.isDestroyed()) w.webContents.send(channel, payload);
@@ -273,42 +303,76 @@ function registerIpc() {
       const cr = pm.start(c.id, { ...c.run, logTo: id, logPrefix: c.name });
       companions.push({ id: c.id, name: c.name, ok: cr.ok, error: cr.error });
     }
-    return { ...r, companions };
+    if (r.ok) pm.clearCrash(id); // 手动启动成功：清掉崩溃计数，重置自动重启退避
+    const warn = r.ok ? await waitReady(svc.probePorts) : '';
+    return { ...r, companions, ...(warn ? { warn } : {}) };
   });
 
   ipcMain.handle('svc:stop', async (_e, id) => {
     const svc = buildServiceList().find((x) => x.id === id);
     // 先停附属服务，再停主服务（顺序反了容易留孤儿进程）
     for (const c of (svc && svc.companions) || []) pm.stop(c.id);
-    return pm.stop(id, svc ? svc.probePorts : [], svc ? svc.run.cwd : '');
+    // 必须传 verify：非托管实例（管理器没托管，靠端口/命令行反查）要靠身份特征确认归属。
+    // 不传时 verify 为空 → 端口命中的进程一律被判「无法确认是本服务」→ 停止按钮永远失败。
+    const r = pm.stop(id, svc ? svc.probePorts : [], svc ? svc.run.cwd : '', {
+      verify: (svc && svc.run.verify) || [],
+    });
+    // 等进程真正退出再返回，否则前端立刻刷新仍看到端口在线，状态反复跳
+    if (r.ok) await pm.waitStopped(r.pids);
+    return r;
   });
   ipcMain.handle('svc:logs', (_e, id) => pm.getLogs(id));
 
   ipcMain.handle('svc:restart', async (_e, id) => {
     const svc = buildServiceList().find((x) => x.id === id);
-    for (const c of (svc && svc.companions) || []) pm.stop(c.id);
-    // 不再无条件信任 stop 结果：停止失败直接中止重启，禁止继续 start，避免叠加新实例
-    const stopR = pm.stop(id, svc ? svc.probePorts : [], svc ? svc.run.cwd : '', { verify: (svc && svc.run.verify) || [] });
-    if (!stopR.ok) {
+    if (!svc) return { ok: false, error: '未知服务' };
+    // 先判可启动性，再做停止：反过来的话，服务不可启动时会被停掉却起不来
+    if (!svc.startable) return { ok: false, error: svc.blockedReason || '无法启动' };
+
+    for (const c of svc.companions || []) pm.stop(c.id);
+
+    // 服务本来就没在运行时（崩溃过 / 首次启动），stop 会返回 notRunning。
+    // 这不是错误，直接进启动分支。以前无条件当失败中止，导致「没运行 → 点重启 → 报停止失败」
+    // → DSH 一旦崩过一次，重启按钮就永久失效。
+    const verify = svc.run.verify || [];
+    const stopR = pm.stop(id, svc.probePorts, svc.run.cwd, { verify });
+    if (!stopR.ok && !stopR.notRunning) {
       return { ok: false, error: `停止失败，已中止重启：${stopR.error || '未知错误'}` };
     }
-    // 等端口真正释放（DSH 这类 GUI 程序退出较慢，固定 1.2s 常常没退干净就重启 → 抢端口失败）
-    const ports = (svc && svc.probePorts) || [];
+    // 等 PID 真正消失（taskkill 返回 0 不代表进程已终止，DSH 这类 Electron 程序退出更慢）
+    if (stopR.ok) {
+      const gone = await pm.waitStopped(stopR.pids, 8000);
+      if (!gone) {
+        return { ok: false, error: '旧进程在 8s 内未退出，已中止重启以避免残留多实例' };
+      }
+    }
+
+    // 等端口真正释放（旧实例没退净就重启 → 抢端口失败，新进程立刻退出）
+    const ports = svc.probePorts || [];
     const deadline = Date.now() + 10000;
     while (ports.length && Date.now() < deadline) {
       const ups = await Promise.all(ports.map((p) => probePort(p, '127.0.0.1', 400)));
       if (!ups.some(Boolean)) break;
       await new Promise((r) => setTimeout(r, 400));
     }
-    if (!svc || !svc.startable) return { ok: false, error: (svc && svc.blockedReason) || '无法启动' };
-    // 等端口释放循环超时后端口仍被占用：旧实例未退净，直接启动会再叠加实例，报错中止
-    const stillUp = await Promise.all(ports.map((p) => probePort(p, '127.0.0.1', 400)));
-    if (ports.length && stillUp.some(Boolean)) {
-      return { ok: false, error: `端口 ${ports.join('/')} 在停止后仍未释放，已中止重启以避免残留多实例` };
+    if (ports.length) {
+      const stillUp = await Promise.all(ports.map((p) => probePort(p, '127.0.0.1', 400)));
+      if (stillUp.some(Boolean)) {
+        return { ok: false, error: `端口 ${ports.join('/')} 在停止后仍未释放，已中止重启以避免残留多实例` };
+      }
     }
+
+    pm.clearCrash(id); // 手动重启：清崩溃计数，重开自动重启退避窗口
     const r = pm.start(id, svc.run);
-    for (const c of svc.companions || []) pm.start(c.id, { ...c.run, logTo: id, logPrefix: c.name });
-    return r;
+    if (!r.ok) return r;
+    const companions = [];
+    for (const c of svc.companions || []) {
+      const cr = pm.start(c.id, { ...c.run, logTo: id, logPrefix: c.name });
+      companions.push({ id: c.id, name: c.name, ok: cr.ok, error: cr.error });
+    }
+    // 等端口就绪再返回：否则前端刷新看到「未运行」，会把成功重启误判成失败
+    const warn = await waitReady(ports, 20000);
+    return { ...r, companions, ...(warn ? { warn } : {}) };
   });
 
   // 一键全部启动：按依赖顺序，每个等端口就绪再起下一个
@@ -355,18 +419,7 @@ function registerIpc() {
     return results;
   });
 
-  ipcMain.handle('svc:stopAll', () => {
-    // 传入每个服务的探活端口 + 工作目录 + 身份特征：非托管（用户手动开的）服务也能停掉，且不误杀
-    const portsById = {};
-    const cwdById = {};
-    const optsById = {};
-    for (const svc of buildServiceList()) {
-      portsById[svc.id] = svc.probePorts;
-      cwdById[svc.id] = svc.run.cwd || '';
-      optsById[svc.id] = { verify: svc.run.verify || [] };
-    }
-    return pm.stopAll(portsById, cwdById, optsById);
-  });
+  ipcMain.handle('svc:stopAll', () => stopAllServices());
 
   // 配置读写
   ipcMain.handle('config:read', (_e, component) => {
@@ -708,4 +761,4 @@ function registerIpc() {
   };
 }
 
-module.exports = { registerIpc, pm };
+module.exports = { registerIpc, pm, stopAllServices };

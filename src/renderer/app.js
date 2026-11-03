@@ -290,6 +290,8 @@ async function renderServices() {
     }
     if (!r.ok && r.error) toast(r.error, true);
     else if (r.reused && r.message) toast(r.message);
+    // 进程起来了但端口还没就绪：必须提示，否则界面显示「未运行」会被当成操作失败
+    else if (r.warn) toast(r.warn, true);
     // 附属服务启动失败单独提示（主服务仍然成功时不打断）
     const bad = (r.companions || []).filter((c) => !c.ok && c.error);
     if (bad.length) toast('附属服务启动失败：' + bad.map((c) => `${c.name}（${c.error}）`).join('、'), true);

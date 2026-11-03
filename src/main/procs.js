@@ -1,11 +1,54 @@
 // procs.js — 服务进程管理：spawn / 停止(taskkill 树杀) / 日志环形缓冲 / 端口探活
 'use strict';
 const { spawn, spawnSync } = require('child_process');
+const { StringDecoder } = require('string_decoder');
 const net = require('net');
 const os = require('os');
 const fs = require('fs');
 
 const LOG_LIMIT = 1000; // 每服务保留最近 1000 行
+
+// PID 是否仍存活。process.kill(pid, 0) 只做句柄探测不发送信号：
+//   ESRCH = 进程已不存在；EPERM = 存在但无权限打开（受保护进程）→ 仍算存活。
+function isPidAlive(pid) {
+  const n = Number(pid);
+  if (!n || n <= 4) return false;
+  try {
+    process.kill(n, 0);
+    return true;
+  } catch (e) {
+    return e && e.code === 'EPERM';
+  }
+}
+
+// 按流维护行缓冲。
+// 为什么不能每块 chunk 单独 split('\n')：chunk 边界随时可能切在
+// `dsh web: http://127.0.0.1:3080/?token=xxx` 中间，逐块处理会把该行劈成两段半行，
+// 两段都不匹配 URL 正则 → token 永远捕获不到 → Web 入口打不开（401）。
+// StringDecoder 负责跨 chunk 的多字节 UTF-8 拼接，避免中文日志乱码。
+function makeLineReader(onLine) {
+  const decoder = new StringDecoder('utf8');
+  let buf = '';
+  const emit = (line) => {
+    if (line) onLine(line);
+  };
+  return {
+    push(chunk) {
+      buf += decoder.write(chunk);
+      // 防御：刷屏输出长时间不带换行时，只保留尾部，避免无界增长
+      if (buf.length > 64 * 1024) buf = buf.slice(-32 * 1024);
+      const parts = buf.split(/\r?\n/);
+      buf = parts.pop(); // 最后一段可能是半行，留到下一次 chunk 再拼
+      for (const line of parts) emit(line);
+    },
+    // 进程退出时把残留半行吐出去，否则最后一行（常含关键错误）会丢
+    flush() {
+      buf += decoder.end();
+      if (buf) emit(buf.replace(/\r$/, ''));
+      buf = '';
+    },
+  };
+}
 
 // DSH web 启动时会打印 `dsh web: http://127.0.0.1:3080/?token=xxx`，
 // token 仅进程启动时 mint 一次、不落盘，必须从该行捕获，供 Web 入口按钮拼接
@@ -197,12 +240,28 @@ class ProcessManager {
 
   isRunning(id) {
     const p = this.procs.get(id);
-    if (!p) return false;
+    if (!p || !p.pid) return false;
     try {
-      return p.pid && p.exitCode === null && !p.killed;
+      // exitCode / signalCode 由 Node 在子进程真实退出时写入；两者仍为 null 才是活着的。
+      // killed 只反映本地 child.kill() 调用，外部 taskkill 不会置位，不能单独作为判据。
+      return p.exitCode === null && p.signalCode === null && !p.killed;
     } catch {
       return false;
     }
+  }
+
+  // 等一批 PID 真正消失。
+  // taskkill /T /F 返回 0 只代表命令执行成功，不代表目标已经终止（GUI 程序退出更慢）。
+  // 不等就 start，会出现「旧实例还没死透、新实例抢不到端口」→ 重启看似成功但服务没起来。
+  async waitStopped(pids, timeout = 8000) {
+    const list = [...new Set((pids || []).map(Number))].filter((n) => n > 4);
+    if (!list.length) return true;
+    const deadline = Date.now() + timeout;
+    while (Date.now() < deadline) {
+      if (!list.some(isPidAlive)) return true;
+      await new Promise((r) => setTimeout(r, 120));
+    }
+    return !list.some(isPidAlive);
   }
 
   pushLog(id, line) {
@@ -272,33 +331,51 @@ class ProcessManager {
     }
 
     this.procs.set(id, child);
+    // 新进程启动：上一次运行 mint 的 token 立即作废（DSH 每次启动都换 token）。
+    // 不清掉会让 svc:list 把过期 token 拼进 Web 入口，点开直接 401 —— 这就是重启后「打不开」的来源。
+    this.webTokens.delete(id);
+    // userStopped 里可能还残留上一次 stop 的标记（旧 child 的 exit 事件尚未派发）。
+    // 不清掉会把新进程的真实崩溃误判成「用户主动停止」，导致不触发自动重启。
+    this.userStopped.delete(id);
+
     const tag = `[${new Date().toLocaleTimeString()}] 已启动 (pid ${child.pid})`;
     push(tag);
 
-    const onData = (buf) => {
-      for (const line of buf.toString('utf8').split(/\r?\n/)) {
-        if (line.trim()) push(line);
-      }
-    };
-    child.stdout.on('data', onData);
-    child.stderr.on('data', onData);
+    const outReader = makeLineReader((line) => {
+      if (line.trim()) push(line);
+    });
+    const errReader = makeLineReader((line) => {
+      if (line.trim()) push(line);
+    });
+    if (child.stdout) child.stdout.on('data', (b) => outReader.push(b));
+    if (child.stderr) child.stderr.on('data', (b) => errReader.push(b));
     child.on('error', (e) => {
       const hint =
         e.code === 'ENOENT'
           ? `找不到可执行文件: ${launchedExe || command || shellCmd}（检查路径是否存在）`
           : `${e.code || ''} ${e.message}`;
       push(`[错误] ${hint}`);
-      this.procs.delete(id); // 起不来的不留在托管表里，避免 isRunning 误判
+      if (this.procs.get(id) === child) this.procs.delete(id); // 起不来的不留在托管表里，避免 isRunning 误判
       if (this.onExit) this.onExit(id, -1);
     });
     child.on('exit', (code, signal) => {
+      outReader.flush();
+      errReader.flush();
       push(`[${new Date().toLocaleTimeString()}] 进程退出 (code=${code}, signal=${signal})`);
-      this.procs.delete(id);
+      // 只有登记表里仍是这个 child 才允许清账。
+      // 重启时旧进程的 exit 回调可能晚于新进程 start 到达，无条件 delete 会把刚起来的新 child
+      // 从托管表里删掉 → managed=false、状态显示「未运行」、停止按钮失效、再次重启报「停止失败」。
+      const current = this.procs.get(id);
+      if (current === child) {
+        this.procs.delete(id);
+        this.webTokens.delete(id); // 进程已死，token 一定失效，不能留给前端拼 URL
+      }
       // 用户主动停止导致的退出不算崩溃：不触发自动重启，也不累计崩溃计数
       if (this.userStopped.has(id)) {
         this.userStopped.delete(id);
         this.clearCrash(id);
-      } else if (this.onExit) {
+      } else if (current === child && this.onExit) {
+        // 被替换掉的旧进程退出不回调 onExit，否则会触发对「用户刚重启的服务」的崩溃自动重启
         this.onExit(id, code);
       }
     });
@@ -316,8 +393,10 @@ class ProcessManager {
         const r = spawnSync('taskkill', ['/PID', String(p.pid), '/T', '/F'], { encoding: 'utf8', timeout: 8000 });
         if (r.status === 0) {
           this.procs.delete(id);
+          this.webTokens.delete(id); // 进程已停止，token 失效
           this.pushLog(id, `[${new Date().toLocaleTimeString()}] 已停止`);
-          return { ok: true };
+          // 把 PID 交回调用方，由 waitStopped 确认真正退出（taskkill 返回 0 ≠ 已终止）
+          return { ok: true, pids: [p.pid] };
         }
         // taskkill 失败：保留托管记录（isRunning 仍为 true），避免后续 start/restart 叠加新实例
         this.userStopped.delete(id);
@@ -329,7 +408,9 @@ class ProcessManager {
     }
 
     // 非托管分支：端口反查 → 命令行兜底
-    if ((!ports || !ports.length) && !cwd) return { ok: false, error: '服务未在运行' };
+    if ((!ports || !ports.length) && !cwd) {
+      return { ok: false, notRunning: true, error: '服务未在运行' };
+    }
     const portPids = new Set();
     for (const port of ports || []) {
       for (const pid of pidsByPort(port)) portPids.add(pid);
@@ -342,7 +423,7 @@ class ProcessManager {
       for (const pid of pidsByCmdline(n)) cmdPids.add(pid);
     }
     const pids = new Set([...portPids, ...cmdPids]);
-    if (!pids.size) return { ok: false, error: '服务未在运行' };
+    if (!pids.size) return { ok: false, notRunning: true, error: '服务未在运行' };
 
     // 防误杀与防漏杀的平衡：
     // - 端口命中的 PID：端口是服务自己的 probePorts，命中即视为本服务；命令行反查失败（权限/僵尸）
@@ -373,25 +454,44 @@ class ProcessManager {
       if (!killPidTree(t.pid)) errors.push(t.pid);
     }
     const killed = targets.filter((t) => !errors.includes(t.pid)).map((t) => t.pid);
+    if (killed.length) this.webTokens.delete(id); // 外部实例被清掉，旧 token 同样失效
     this.pushLog(id, `[${new Date().toLocaleTimeString()}] 已停止外部进程 (pid ${killed.join(', ')})`);
     return errors.length
-      ? { ok: false, error: `部分进程停止失败: ${errors.join(', ')}` }
-      : { ok: true };
+      ? { ok: false, pids: killed, error: `部分进程停止失败: ${errors.join(', ')}` }
+      : { ok: true, pids: killed };
   }
 
-  stopAll(portsById = {}, cwdById = {}, optsById = {}) {
+  async stopAll(portsById = {}, cwdById = {}, optsById = {}) {
+    // 先同步下达所有 taskkill，再逐个等 PID 消失。
+    // 不能边杀边等：await 会挂起循环，排在后面的服务就没机会被杀。
+    const { stopped, pids } = this.stopAllSync(portsById, cwdById, optsById);
+    await this.waitStopped(pids);
+    return stopped;
+  }
+
+  // 同步停止全部，不做任何 await。
+  // before-quit 是同步钩子，用不了 async —— 一旦 await，剩余服务不会被停掉，退出后残留孤儿进程。
+  stopAllSync(portsById = {}, cwdById = {}, optsById = {}) {
     const stopped = [];
+    const pids = [];
     // 托管的直接杀
     for (const id of [...this.procs.keys()]) {
-      if (this.stop(id, portsById[id] || [], cwdById[id] || '', optsById[id] || {}).ok) stopped.push(id);
+      const r = this.stop(id, portsById[id] || [], cwdById[id] || '', optsById[id] || {});
+      if (r.ok) {
+        stopped.push(id);
+        if (r.pids) pids.push(...r.pids);
+      }
     }
     // 非托管但端口在线的也一并处理
     for (const id of Object.keys(portsById)) {
       if (stopped.includes(id)) continue;
       const r = this.stop(id, portsById[id], cwdById[id] || '', optsById[id] || {});
-      if (r.ok) stopped.push(id);
+      if (r.ok) {
+        stopped.push(id);
+        if (r.pids) pids.push(...r.pids);
+      }
     }
-    return stopped;
+    return { stopped, pids };
   }
 
   getLogs(id) {
@@ -419,4 +519,4 @@ function probePort(port, host = '127.0.0.1', timeout = 800) {
   });
 }
 
-module.exports = { ProcessManager, probePort, parseShellCmd };
+module.exports = { ProcessManager, probePort, parseShellCmd, isPidAlive, makeLineReader };
