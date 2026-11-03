@@ -2,19 +2,34 @@
 'use strict';
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const { spawnSync } = require('child_process');
 const { settings, defaultScanRoot, scanRoots } = require('./store');
 
 // 扫描时跳过的重目录（避免扫到 AppData / 系统目录拖慢检测）
 const SKIP_DIRS = new Set([
   '$recycle.bin', 'appdata', 'windows', 'program files', 'program files (x86)',
-  'programdata', 'node_modules', 'system volume information',
+  'programdata', 'node_modules', 'system volume information', 'temp',
 ]);
+
+// 判断路径是否位于系统临时目录（兼容 8.3 短名 / 环境变量形式）：
+// 1) 与 os.tmpdir() 前缀一致；2) 兜底：路径含 <...>\AppData\Local\Temp 段。
+// discoverDir 直接跳过临时目录整棵子树，避免把更新器残留、解压缓存误当安装本体。
+function isSystemTempPath(p) {
+  const l = path.resolve(p).toLowerCase();
+  const tmp = path.resolve(os.tmpdir()).toLowerCase();
+  if (l === tmp || l.startsWith(tmp + path.sep)) return true;
+  return /appdata[\\/]local[\\/]temp([\\/]|$)/.test(l);
+}
+
+// SnowLuma 更新器会往系统 Temp 解压 snowluma-update-* 临时目录，那不是安装本体
+const SNOW_EXCLUDE = /snowluma-update-/i;
 
 // 在 root 下按关键词模糊匹配组件目录：BFS 最多 2 层，收集全部命中
 function discoverDir(root, keywords) {
   const hits = [];
   if (!isDir(root)) return hits;
+  if (isSystemTempPath(root)) return hits;
   const queue = [[root, 0]];
   while (queue.length) {
     const [dir, depth] = queue.shift();
@@ -57,10 +72,10 @@ function pickDir(hits, validator) {
   return hits[0];
 }
 
-function componentDir(key, keywords, validator) {
+function componentDir(key, keywords, validator, exclude) {
   const conf = settings().components[key] || {};
   if (conf.dir && isDir(conf.dir)) return conf.dir;
-  return pickDir(discoverMatches(keywords), validator);
+  return pickDir(discoverMatches(keywords, exclude), validator);
 }
 
 function exists(p) {
@@ -148,8 +163,8 @@ function detectAllImpl() {
 
   // ---- SnowLuma ----
   const snowDir =
-    componentDir('snowluma', ['snowluma'], (d) => exists(path.join(d, 'index.mjs'))) ||
-    componentDir('snowluma', ['snowluma']) ||
+    componentDir('snowluma', ['snowluma'], (d) => exists(path.join(d, 'index.mjs')), SNOW_EXCLUDE) ||
+    componentDir('snowluma', ['snowluma'], null, SNOW_EXCLUDE) ||
     (isDir(qbHomeDirHint) ? qbHomeDirHint : '');
   const snowEntry = snowDir ? path.join(snowDir, 'index.mjs') : '';
   const snowNodeExe = snowDir ? path.join(snowDir, 'node.exe') : '';

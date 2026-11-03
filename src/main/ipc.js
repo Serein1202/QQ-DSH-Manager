@@ -1,7 +1,7 @@
 // ipc.js — 主进程 IPC 路由：检测 / 服务 / 配置 / 下载 / 设置 / Shell
 'use strict';
 const { ipcMain, dialog, shell, BrowserWindow, app } = require('electron');
-const { spawnSync } = require('child_process');
+const { spawnSync, spawn } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -537,6 +537,7 @@ function registerIpc() {
           version: ver,
           installer: find(/\.exe$/i),
           portable: find(/\.zip$/i),
+          zip: find(/\.zip$/i),
           page: m.html_url || '',
           notes: m.body || '',
         };
@@ -560,6 +561,7 @@ function registerIpc() {
         newer: cmpVer(latest, current) > 0,
         installer: rel.installer,
         portable: rel.portable,
+        zip: rel.zip,
         page: rel.page,
         notes: rel.notes,
       };
@@ -568,12 +570,32 @@ function registerIpc() {
     }
   });
 
-  // 下载新版安装包到临时目录，下载完自动运行（NSIS 安装器会自己接管）
-  // 收紧：仅允许下载当前 latest release 的资产，扩展名必须是 .exe，打开前弹确认
+  // 下载新版 zip 到固定根目录，解压到 update-new，写替换脚本分离重启（替代直接运行 portable exe：
+  // portable 每次解压到 Temp 随机目录无法原地覆盖，导致新旧客户端并存）
+  // 收紧：仅允许下载当前 latest release 的资产，扩展名必须是 .zip，执行前弹确认
+  // 在解压目录里找主程序 exe（跳过卸载器，最多 2 层）
+  function findMainExe(dir, maxDepth) {
+    const queue = [[dir, 0]];
+    while (queue.length) {
+      const [d, depth] = queue.shift();
+      let entries;
+      try {
+        entries = fs.readdirSync(d, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+      for (const e of entries) {
+        const full = path.join(d, e.name);
+        if (e.isFile() && /\.exe$/i.test(e.name) && !/uninstall/i.test(e.name) && /qq-dsh-manager/i.test(e.name)) return full;
+        if (e.isDirectory() && depth < maxDepth) queue.push([full, depth + 1]);
+      }
+    }
+    return '';
+  }
   ipcMain.handle('update:install', async (_e, { url }) => {
     try {
       const rel = await fetchManagerRelease();
-      const allowed = [rel.installer, rel.portable].filter(Boolean);
+      const allowed = [rel.zip, rel.installer, rel.portable].filter(Boolean);
       if (!url || !allowed.includes(url)) return { ok: false, error: '仅允许下载官方 Release 资产' };
       let destPath = '';
       try {
@@ -581,23 +603,24 @@ function registerIpc() {
       } catch {
         return { ok: false, error: '无效的下载地址' };
       }
-      if (!/\.exe$/i.test(destPath) && !/\.exe\?/i.test(url)) return { ok: false, error: '安装包必须是 .exe 文件' };
+      if (!/\.zip$/i.test(destPath) && !/\.zip\?/i.test(url)) return { ok: false, error: '更新包必须是 .zip 文件' };
       const ans = await dialog.showMessageBox({
         type: 'warning',
         title: '确认安装更新',
-        message: `即将下载并运行更新安装包：\n${url}\n\n确认继续？`,
-        buttons: ['确认下载并运行', '取消'],
+        message: `即将下载更新包并替换当前版本：\n${url}\n\n确认继续？`,
+        buttons: ['确认下载并更新', '取消'],
         cancelId: 1,
         defaultId: 0,
       });
       if (ans.response !== 0) return { ok: false, error: '已取消更新' };
-      const name = path.basename(destPath) || 'update-installer.exe';
-      const dest = path.join(os.tmpdir(), 'cm-update-' + name);
+      const root = defaultScanRoot();
+      const zipDest = path.join(root, 'cm-update.zip');
+      const stage = path.join(root, 'update-new');
       // 多源回退：直连失败自动切镜像；网络中断时 .part 保留，换源后从断点继续
       let lastErr = null;
       for (const dlUrl of githubDlCandidates(url)) {
         try {
-          await downloadFile(dlUrl, dest, (r, t) => send('dl:progress', { key: 'update', received: r, total: t }));
+          await downloadFile(dlUrl, zipDest, (r, t) => send('dl:progress', { key: 'update', received: r, total: t }));
           lastErr = null;
           break;
         } catch (e) {
@@ -605,9 +628,36 @@ function registerIpc() {
         }
       }
       if (lastErr) throw lastErr;
-      const err = shell.openPath(dest);
-      if (err) return { ok: false, error: err };
-      return { ok: true, file: dest };
+      fs.rmSync(stage, { recursive: true, force: true });
+      unzip(zipDest, stage);
+      fs.rmSync(zipDest, { force: true });
+      // 若解压后顶层只有一层目录（如 win-unpacked），提升其内容到 stage 顶层，保证 exe 落在固定根
+      const topDirs = fs.readdirSync(stage, { withFileTypes: true }).filter((e) => e.isDirectory() && !e.name.startsWith('.'));
+      if (topDirs.length === 1 && !findMainExe(stage, 0) && findMainExe(path.join(stage, topDirs[0].name), 1)) {
+        const inner = path.join(stage, topDirs[0].name);
+        for (const e of fs.readdirSync(inner, { withFileTypes: true })) {
+          fs.renameSync(path.join(inner, e.name), path.join(stage, e.name));
+        }
+        fs.rmdirSync(inner);
+      }
+      const exe = findMainExe(stage, 2);
+      if (!exe) throw new Error('更新包内未找到 QQ-DSH-Manager.exe');
+      const relPath = path.relative(stage, exe).split(path.sep).join('\\');
+      // 替换脚本：等旧进程退出 -> 强制结束残留同名单进程 -> 把 update-new 内容并入固定根 -> 启动新版 -> 自删
+      const bat = path.join(root, 'cm-apply-update.bat');
+      const batContent = [
+        '@echo off',
+        'timeout /t 2 /nobreak >nul',
+        'taskkill /f /im QQ-DSH-Manager.exe >nul 2>&1',
+        'xcopy /e /y /q "%~dp0update-new\\*" "%~dp0" >nul',
+        'rmdir /s /q "%~dp0update-new"',
+        'start "" "%~dp0' + relPath + '"',
+        'del "%~f0"',
+      ].join('\r\n');
+      fs.writeFileSync(bat, batContent, 'utf8');
+      spawn('cmd.exe', ['/d', '/s', '/c', bat], { detached: true, stdio: 'ignore' }).unref();
+      setTimeout(() => app.quit(), 800);
+      return { ok: true, file: exe, relaunch: true };
     } catch (e) {
       return { ok: false, error: e.message };
     }

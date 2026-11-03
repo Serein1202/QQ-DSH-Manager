@@ -68,21 +68,43 @@ function saveSettings(settings) {
   return settings;
 }
 
-function defaultScanRoot() {
-  if (settings().scanRoot) return settings().scanRoot;
-  if (app.isPackaged) return path.dirname(app.getPath('exe'));
-  return path.resolve(__dirname, '../../..');
+// 判断路径是否位于系统临时目录（兼容 8.3 短名 / 环境变量形式）：
+// 1) 与 os.tmpdir() 前缀一致；2) 兜底：路径含 <...>\AppData\Local\Temp 段
+function isInSystemTemp(p) {
+  const os = require('os');
+  const l = path.resolve(p).toLowerCase();
+  const tmp = path.resolve(os.tmpdir()).toLowerCase();
+  if (l === tmp || l.startsWith(tmp + path.sep)) return true;
+  return /appdata[\\/]local[\\/]temp([\\/]|$)/.test(l);
 }
 
-// 多根目录扫描：exe 目录 → 上级 → 桌面 → 用户目录，逐个尝试，命中即停
+// 计算默认根目录：
+// - dev 模式：项目上两级（源码仓库根）
+// - packaged 模式：exe 所在目录；但若 exe 位于系统临时目录（安装器解压运行 /
+//   便携版放 Temp），临时目录随机、重启会变、还会把更新残留扫进来，不能当持久根，
+//   回退到用户主目录下的固定数据目录。已配置 scanRoot 的用户不受影响（始终优先）。
+function defaultRootDir() {
+  if (!app.isPackaged) return path.resolve(__dirname, '../../..');
+  const exeDir = path.dirname(app.getPath('exe'));
+  return isInSystemTemp(exeDir) ? path.join(os.homedir(), 'QQ-DSH-Manager') : exeDir;
+}
+
+function defaultScanRoot() {
+  if (settings().scanRoot) return settings().scanRoot;
+  return defaultRootDir();
+}
+
+// 多根目录扫描：默认根 → exe 目录 → 上级 → 桌面 → 用户目录，逐个尝试，命中即停
+// （exe 在 Temp 时不加入 exe 目录/上级，否则整个 Temp 都被当扫描根）
 function scanRoots() {
   const os = require('os');
   const roots = [];
   const s = settings();
   if (s.scanRoot) roots.push(s.scanRoot);
+  roots.push(defaultRootDir());
   if (app.isPackaged) {
     const exeDir = path.dirname(app.getPath('exe'));
-    roots.push(exeDir, path.dirname(exeDir));
+    if (!isInSystemTemp(exeDir)) roots.push(exeDir, path.dirname(exeDir));
   } else {
     roots.push(path.resolve(__dirname, '../../..'));
   }

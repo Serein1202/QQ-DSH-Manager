@@ -540,10 +540,10 @@ async function checkUpdate() {
       return;
     }
     toast(`发现新版本 v${r.latest}${r.notes ? '：' + r.notes : ''}，开始下载…`);
-    const target = r.installer || r.portable;
+    const target = r.zip || r.installer;
     if (target) {
       const res = await window.api.invoke('update:install', { url: target });
-      if (res.ok) toast('下载完成，安装器已启动，按提示完成安装');
+      if (res.ok) toast('下载完成，将替换旧版本并自动重启');
       else toast('下载失败：' + res.error, true);
     } else if (r.page) {
       window.api.invoke('shell:openExternal', r.page);
