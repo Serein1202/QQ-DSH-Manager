@@ -185,109 +185,214 @@ async function renderHome() {
 }
 
 /* ---------- 视图 2：服务管理 ---------- */
+// 状态刷新模型：
+//   每 2s 拉一次 svc:list（主进程侧是缓存 detect + 异步端口探活，不阻塞、不扫盘）。
+//   只有「状态签名」变化时才重建卡片 DOM，其余轮询只就地更新运行时长/端口图标，
+//   避免每 2s 重建整页导致的闪烁与按钮丢失焦点。
+const SVC_POLL_MS = 2000;
+const SVC_ACTION_TEXT = { start: '启动中…', stop: '停止中…', restart: '重启中…', startAll: '启动中…', stopAll: '停止中…' };
+
+function fmtUptime(ms) {
+  if (!ms || ms < 0) return '';
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}秒`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}分${s % 60}秒`;
+  const h = Math.floor(m / 60);
+  return `${h}小时${m % 60}分`;
+}
+
 async function renderServices() {
   $content.innerHTML = '';
-  $content.append(el('h1', {}, '服务管理'));
-  const startAllBtn = el('button', { class: 'btn primary', onclick: async () => {
-    startAllBtn.disabled = true;
-    const results = await window.api.invoke('svc:startAll');
-    for (const r of results) {
-      if (r.warn) toast(r.warn, true);
-      else if (!r.ok && !r.skipped) toast(`${r.id}: ${r.error || '未启动'}`, true);
-    }
-    toast('一键启动执行完毕');
-    startAllBtn.disabled = false;
-    refresh();
-    for (const d of [1500, 3000, 6000]) setTimeout(() => { if (currentView === 'services') refresh(); }, d);
-  } }, '🚀 一键全部启动');
-  const stopAllBtn = el('button', { class: 'btn danger', onclick: async () => {
-    await window.api.invoke('svc:stopAll');
-    toast('已全部停止');
-    refresh();
-    for (const d of [1500, 3000]) setTimeout(() => { if (currentView === 'services') refresh(); }, d);
-  } }, '全部停止');
-  $content.append(el('div', { class: 'row', style: 'display:flex;gap:10px;margin-bottom:16px' }, startAllBtn, stopAllBtn));
+
+  const statusLine = el('span', { class: 'detail' }, '正在读取状态…');
+  const autoChk = el('input', { type: 'checkbox', checked: true });
+  const refreshBtn = el('button', { class: 'btn' }, '🔄 刷新');
+  const head = el(
+    'div',
+    { class: 'svc-head' },
+    el('h1', {}, '服务管理'),
+    refreshBtn,
+    el('label', { class: 'check', style: 'margin:0' }, autoChk, '自动刷新'),
+    statusLine
+  );
+  $content.append(head);
+  $content.append(el('p', { class: 'sub' }, '状态每 2 秒自动刷新；菜单里点「刷新」会重新扫描组件目录。'));
+
+  const startAllBtn = el('button', { class: 'btn primary' }, '🚀 一键全部启动');
+  const stopAllBtn = el('button', { class: 'btn danger' }, '全部停止');
+  const bulkRow = el('div', { class: 'row', style: 'display:flex;gap:10px;margin-bottom:16px' }, startAllBtn, stopAllBtn);
+  $content.append(bulkRow);
 
   const listWrap = el('div');
   const logBox = el('div', { class: 'log', style: 'display:none' });
+  const logTail = el('div', { class: 'log-tools', style: 'display:none' },
+    el('span', { class: 'detail' }, '只显示最近 1200 行'),
+    el('button', { class: 'btn', onclick: () => { logFor = ''; logBox.style.display = 'none'; logTail.style.display = 'none'; } }, '关闭日志')
+  );
+  $content.append(listWrap, logTail, logBox);
+
   let logFor = '';
+  let logLines = [];
+  const busy = new Map(); // id -> 'start' | 'stop' | 'restart'
+  let lastSig = '';
+  let lastList = [];
+  let ticking = false;
 
-  async function refresh() {
-    const list = await window.api.invoke('svc:list');
-    listWrap.innerHTML = '';
-    for (const svc of list) {
-      const btns = [];
-      if (svc.running) {
-        btns.push(el('button', { class: 'btn', onclick: () => doSvc('svc:stop', svc.id) }, '停止'));
-        btns.push(el('button', { class: 'btn', onclick: () => doSvc('svc:restart', svc.id) }, '重启'));
-      } else if (svc.startable) {
-        btns.push(el('button', { class: 'btn primary', onclick: () => doSvc('svc:start', svc.id) }, '启动'));
-      }
-      // Web 入口按钮：端口探活通过才可点
-      const links = svc.webLinks.map((l) =>
-        el('button', {
-          class: 'btn' + (l.open ? ' primary' : ''),
-          disabled: !l.open,
-          title: l.url,
-          onclick: async () => {
-            if (!l.open) return;
-            const r = await window.api.invoke('shell:openExternal', l.url);
-            if (r && !r.ok) toast(r.error || '打开浏览器失败', true);
-          },
-        }, '🌐 ' + l.label + (l.open ? '' : '（未就绪）'))
-      );
-      const portInfo = Object.entries(svc.ports).map(([p, up]) => `:${p} ${up ? '✅' : '❌'}`).join(' ');
-      listWrap.append(
-        el(
-          'div',
-          { class: 'card' },
-          el(
-            'div',
-            { class: 'row' },
-            el('span', { class: 'dot ' + (svc.running ? 'ok' : 'off') }),
-            el('h3', {}, svc.name),
-            el('span', { class: 'detail', style: 'flex:1' }, `${svc.desc} ${portInfo} ${svc.managed ? '· 由管理器托管' : svc.running ? '· 外部进程' : ''}${svc.companionHint ? ' · ' + svc.companionHint : ''}`),
-            ...links,
-            ...btns
-          ),
-          !svc.running && !svc.startable && svc.blockedReason
-            ? el('p', { class: 'detail', style: 'margin-top:8px;color:var(--warn)' }, '⚠ ' + svc.blockedReason)
-            : null,
-          svc.managed
-            ? el('div', { class: 'row', style: 'margin-top:8px' },
-                el('button', { class: 'btn', onclick: () => toggleLog(svc.id) }, '查看日志'))
-            : null
-        )
-      );
-    }
-    if (logFor) showLog(logFor);
+  // ---- 日志：主进程按 100ms 批量推送，这里一次 append，不重建整块 ----
+  function dealLog(id, lines) {
+    if (id !== logFor) return;
+    logLines.push(...lines);
+    if (logLines.length > 1200) logLines.splice(0, logLines.length - 1200);
+    logBox.textContent = logLines.join('\n');
+    logBox.scrollTop = logBox.scrollHeight;
   }
-
   async function showLog(id) {
+    logFor = id;
     const logs = await window.api.invoke('svc:logs', id);
+    logLines = logs.slice(-1200);
     logBox.style.display = 'block';
-    logBox.textContent = logs.join('\n') || '（暂无日志）';
+    logTail.style.display = 'flex';
+    logBox.textContent = logLines.join('\n') || '（暂无日志）';
     logBox.scrollTop = logBox.scrollHeight;
   }
   function toggleLog(id) {
-    logFor = logFor === id ? '' : id;
-    if (!logFor) logBox.style.display = 'none';
-    else showLog(id);
+    if (logFor === id) {
+      logFor = '';
+      logBox.style.display = 'none';
+      logTail.style.display = 'none';
+    } else showLog(id);
   }
+
+  // ---- 卡片 ----
+  function signature(list) {
+    return JSON.stringify(
+      list.map((s) => [
+        s.id,
+        s.running,
+        s.managed,
+        s.startable,
+        s.blockedReason,
+        s.ports,
+        s.webLinks.map((l) => [l.url, l.open]),
+        busy.get(s.id) || '',
+      ])
+    );
+  }
+
+  function draw(list) {
+    listWrap.innerHTML = '';
+    for (const svc of list) {
+      const op = busy.get(svc.id);
+      const dot = el('span', { class: 'dot ' + (op ? 'warn' : svc.running ? 'ok' : 'off') });
+      const meta = el('span', { class: 'detail', style: 'flex:1' });
+      const btns = [];
+
+      if (op) {
+        // 操作进行中：按钮全禁用 + 文案变成「重启中…」，让用户知道没卡住
+        btns.push(el('button', { class: 'btn', disabled: true }, SVC_ACTION_TEXT[op] || '处理中…'));
+      } else if (svc.running) {
+        btns.push(el('button', { class: 'btn', onclick: () => doSvc('svc:stop', svc.id, 'stop') }, '停止'));
+        btns.push(el('button', { class: 'btn', onclick: () => doSvc('svc:restart', svc.id, 'restart') }, '重启'));
+      } else if (svc.startable) {
+        btns.push(el('button', { class: 'btn primary', onclick: () => doSvc('svc:start', svc.id, 'start') }, '启动'));
+      }
+
+      // Web 入口：端口真的在监听才可点，URL 里带主进程捕获的 token
+      const links = svc.webLinks.map((l) =>
+        el(
+          'button',
+          {
+            class: 'btn' + (l.open ? ' primary' : ''),
+            disabled: !l.open,
+            title: l.url,
+            onclick: async () => {
+              if (!l.open) return;
+              const r = await window.api.invoke('shell:openExternal', l.url);
+              if (r && !r.ok) toast(r.error || '打开浏览器失败', true);
+            },
+          },
+          '🌐 ' + l.label + (l.open ? '' : '（未就绪）')
+        )
+      );
+
+      const row = el('div', { class: 'card', 'data-svc': svc.id },
+        el('div', { class: 'row' }, dot, el('h3', {}, svc.name), meta, ...links, ...btns),
+        !svc.running && !svc.startable && svc.blockedReason
+          ? el('p', { class: 'detail', style: 'margin-top:8px;color:var(--warn)' }, '⚠ ' + svc.blockedReason)
+          : null,
+        el('div', { class: 'row', style: 'margin-top:8px' },
+          svc.managed ? el('button', { class: 'btn', onclick: () => toggleLog(svc.id) }, logFor === svc.id ? '收起日志' : '查看日志') : null,
+          el('span', { class: 'detail' }, svc.pid ? `pid ${svc.pid}` : '')
+        )
+      );
+      row._meta = meta;
+      row._svc = svc;
+      listWrap.append(row);
+      paintMeta(row);
+    }
+  }
+
+  // 就地更新可变文案（运行时长每秒都在变，不属于签名）
+  function paintMeta(row) {
+    const svc = row._svc;
+    const op = busy.get(svc.id);
+    const portInfo = Object.entries(svc.ports).map(([p, up]) => `:${p} ${up ? '✅' : '❌'}`).join(' ');
+    const mode = svc.managed ? '· 由管理器托管' : svc.running ? '· 外部进程' : '';
+    const up = svc.uptimeMs ? `· 已运行 ${fmtUptime(svc.uptimeMs)}` : '';
+    const state = op ? `· ${SVC_ACTION_TEXT[op] || '处理中'}` : svc.running ? '· 运行中' : '· 已停止';
+    const cpHint = svc.companionHint ? ' · ' + svc.companionHint : '';
+    row._meta.textContent = `${svc.desc} ${portInfo} ${state} ${mode} ${up}${cpHint}`.replace(/\s+/g, ' ');
+  }
+
+  async function tick(manual = false) {
+    if (ticking) return;
+    ticking = true;
+    try {
+      const list = manual ? (await window.api.invoke('svc:refresh')).list : await window.api.invoke('svc:list');
+      lastList = list;
+      const sig = signature(list);
+      if (sig !== lastSig) {
+        lastSig = sig;
+        draw(list);
+      } else {
+        for (const row of listWrap.children) {
+          const s = list.find((x) => x.id === row.dataset.svc);
+          if (s) {
+            row._svc = s;
+            paintMeta(row);
+          }
+        }
+      }
+      statusLine.textContent = `状态已同步 ${new Date().toLocaleTimeString()}`;
+    } catch (e) {
+      statusLine.textContent = '状态刷新失败：' + (e && e.message ? e.message : e);
+    } finally {
+      ticking = false;
+    }
+  }
+
   const svcOpKeys = new Set(); // 操作互斥：进行中的服务操作 (channel|id)，防止快速连点并发重复 spawn
-  async function doSvc(channel, id) {
+  async function doSvc(channel, id, kind) {
     const key = channel + '|' + id;
     if (svcOpKeys.has(key)) {
       toast('该操作正在执行中，请稍候', true);
       return;
     }
     svcOpKeys.add(key);
+    busy.set(id, kind);
+    lastSig = ''; // 强制重绘（按钮切到「重启中…」且禁用）
+    draw(lastList);
     let r = null;
     try {
       r = await window.api.invoke(channel, id);
+    } catch (e) {
+      r = { ok: false, error: (e && e.message) || '调用失败' };
     } finally {
       svcOpKeys.delete(key);
+      busy.delete(id);
     }
+    if (!r) r = { ok: false, error: '未知错误' };
     if (!r.ok && r.error) toast(r.error, true);
     else if (r.reused && r.message) toast(r.message);
     // 进程起来了但端口还没就绪：必须提示，否则界面显示「未运行」会被当成操作失败
@@ -295,18 +400,78 @@ async function renderServices() {
     // 附属服务启动失败单独提示（主服务仍然成功时不打断）
     const bad = (r.companions || []).filter((c) => !c.ok && c.error);
     if (bad.length) toast('附属服务启动失败：' + bad.map((c) => `${c.name}（${c.error}）`).join('、'), true);
-    refresh();
+    lastSig = '';
+    tick();
     // 端口打开有延迟：1s / 3s / 6s 各补刷一次，状态和链接按钮尽快点亮
-    for (const d of [1500, 3000, 6000]) setTimeout(() => { if (currentView === 'services') refresh(); }, d);
+    for (const d of [1000, 3000, 6000]) setTimeout(() => { if (currentView === 'services') tick(); }, d);
   }
 
-  onChan('proc:log', ({ id }) => { if (id === logFor) showLog(id); });
-  onChan('proc:exit', () => refresh());
+  // ---- 顶部批量按钮 ----
+  startAllBtn.addEventListener('click', async () => {
+    startAllBtn.disabled = true;
+    const old = startAllBtn.textContent;
+    startAllBtn.textContent = '🚀 启动中…';
+    try {
+      const results = await window.api.invoke('svc:startAll');
+      for (const r of results) {
+        if (r.warn) toast(r.warn, true);
+        else if (!r.ok && !r.skipped) toast(`${r.id}: ${r.error || '未启动'}`, true);
+      }
+      if (!results.some((r) => !r.ok && !r.skipped)) toast('一键启动执行完毕');
+    } finally {
+      startAllBtn.disabled = false;
+      startAllBtn.textContent = old;
+      lastSig = '';
+      tick();
+    }
+  });
+  stopAllBtn.addEventListener('click', async () => {
+    stopAllBtn.disabled = true;
+    const old = stopAllBtn.textContent;
+    stopAllBtn.textContent = '停止中…';
+    try {
+      await window.api.invoke('svc:stopAll');
+      toast('已全部停止');
+    } finally {
+      stopAllBtn.disabled = false;
+      stopAllBtn.textContent = old;
+      lastSig = '';
+      tick();
+    }
+  });
+  refreshBtn.addEventListener('click', async () => {
+    refreshBtn.disabled = true;
+    refreshBtn.textContent = '扫描中…';
+    statusLine.textContent = '正在重新扫描组件目录…';
+    try {
+      await tick(true);
+      toast('已刷新');
+    } finally {
+      refreshBtn.disabled = false;
+      refreshBtn.textContent = '🔄 刷新';
+    }
+  });
 
-  $content.append(listWrap, logBox);
-  refresh();
+  onChan('proc:log', (payload) => {
+    if (currentView !== 'services') return;
+    if (Array.isArray(payload.lines)) dealLog(payload.id, payload.lines);
+    else if (payload.line) dealLog(payload.id, [payload.line]);
+  });
+  onChan('proc:exit', () => {
+    if (currentView === 'services') {
+      lastSig = '';
+      tick();
+    }
+  });
+
+  await tick();
   if (pollTimer) clearInterval(pollTimer);
-  pollTimer = setInterval(() => { if (currentView === 'services') refresh(); }, 2500);
+  // 每次轮询都会带回新的 uptimeMs，paintMeta 就地更新，不需要重建卡片
+  pollTimer = setInterval(() => {
+    if (currentView !== 'services') return;
+    if (!autoChk.checked) return;
+    tick();
+  }, SVC_POLL_MS);
 }
 
 /* ---------- 视图 3：凭证配置 ---------- */const QB_FIELDS = [
@@ -541,16 +706,18 @@ async function checkUpdate() {
       toast(`已是最新版本 v${r.current}`);
       return;
     }
-    toast(`发现新版本 v${r.latest}${r.notes ? '：' + r.notes : ''}，开始下载…`);
     const target = r.zip || r.installer;
-    if (target) {
+    if (!target) {
+      // 后端在 API 限流时走网页跳转兜底，只有版本号没有资产直链 → 直接打开 Release 页面
+      toast(`发现新版本 v${r.latest}，将打开 Release 页面，请手动下载`);
+      if (r.page) window.api.invoke('shell:openExternal', r.page);
+      return;
+    }
+    toast(`发现新版本 v${r.latest}${r.notes ? '：' + r.notes : ''}，开始下载…`);
+    {
       const res = await window.api.invoke('update:install', { url: target });
       if (res.ok) toast('下载完成，将替换旧版本并自动重启');
       else toast('下载失败：' + res.error, true);
-    } else if (r.page) {
-      window.api.invoke('shell:openExternal', r.page);
-    } else {
-      toast('清单里没有下载地址，请联系维护者', true);
     }
   } finally {
     btn.disabled = false;
@@ -567,7 +734,20 @@ async function checkUpdate() {
   );
   const ver = el('div', { style: 'margin-top:6px;font-size:11px;color:var(--muted)' });
   $foot.append(status, btn, upWrap, ver);
-  window.api.invoke('app:version').then((v) => (ver.textContent = 'v' + v));
+
+  // 只有 Release 打包产物才显示版本号 + 更新入口。
+  // 开发版（源码运行）的版本号没有发布语义，显示出来会让人误以为「已是最新版」，
+  // 更新检测同理——直接不渲染，而不是渲染成「未知」。
+  window.api.invoke('app:version').then((r) => {
+    const packaged = !!(r && r.packaged);
+    if (!packaged) {
+      btn.remove();
+      upWrap.remove();
+      ver.remove();
+      return;
+    }
+    ver.textContent = 'v' + (r.version || '');
+  });
 })();
 
 async function footStatus() {

@@ -1,6 +1,6 @@
 {
   "name": "qq-dsh-manager",
-  "version": "1.0.4",
+  "version": "1.1.0",
   "description": "拟人化 AI 一键部署管理器：SnowLuma / DSH / qq-bridge / ai-companion-kit",
   "main": "src/main/index.js",
   "author": "Serein1202",

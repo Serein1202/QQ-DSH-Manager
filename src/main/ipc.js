@@ -14,6 +14,42 @@ const { downloadFile, unzip, npmInstall, fetchJson, GITHUB_MIRRORS, githubMirror
 const pm = new ProcessManager();
 const downloads = new Map(); // key -> { running: true } 防重复下载
 
+// ---------- 版本号 ----------
+// 约定：只有打包产物（Release 下载的安装版/便携版）才对外暴露版本号与更新检测；
+// 源码运行（app.isPackaged === false，含 npm start / 启动.bat / electron <入口>）一律视为开发版，
+// 界面不显示版本号、不提供更新入口 —— 开发版没有稳定的版本语义，暴露出来只会误导（见下方 getVersion 退化问题）。
+//
+// 打包态下版本号不直接信任 app.getVersion()：它只在「应用根目录有 package.json」时才返回本项目版本，
+// 一旦以入口文件方式启动（electron src/main/index.js），Electron 把内置默认应用当根目录，
+// 返回的是 Electron 自身版本（实测 33.4.11）。所以读 package.json 并校验 name，读不到才回退。
+const PKG_NAME = 'qq-dsh-manager';
+let _verCache = '';
+function managerVersion() {
+  if (_verCache) return _verCache;
+  // 候选根目录按可靠性排序：打包态 app.asar → 源码目录（__dirname 上溯两级）→ resources/app
+  const roots = [];
+  try { roots.push(app.getAppPath()); } catch { /* 极端情况下取不到，跳过 */ }
+  roots.push(path.join(__dirname, '..', '..'));
+  if (process.resourcesPath) roots.push(path.join(process.resourcesPath, 'app'));
+  for (const root of roots) {
+    try {
+      const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+      if (pkg && pkg.name === PKG_NAME && pkg.version) {
+        _verCache = String(pkg.version);
+        return _verCache;
+      }
+    } catch {
+      // 单个候选读不到不影响下一个
+    }
+  }
+  return app.getVersion() || '0.0.0';
+}
+
+// 是否 Release 打包产物。开发版据此关闭版本号显示与更新检测。
+function isReleaseBuild() {
+  try { return app.isPackaged === true; } catch { return false; }
+}
+
 // 等一组端口至少有一个就绪：就绪返回空串，超时返回提示文案。
 // 为什么要等：spawn 只代表进程创建成功，服务真正可用要等它监听端口。
 // 不等就返回 ok，前端 1.5s 刷新时看到「未运行」，用户会认为启动/重启失败。
@@ -31,7 +67,17 @@ async function waitReady(ports, timeout = 15000) {
 
 // 停止全部服务（含用户手动启动、未被托管的实例，靠端口 + 身份特征反查）。
 // sync=true：只同步下达 taskkill、不等待退出，供 before-quit 这类同步钩子使用。
-function stopAllServices(sync = false) {
+function stopAllServicesSync() {
+  const { portsById, cwdById, optsById } = serviceTargets();
+  return pm.stopAllSync(portsById, cwdById, optsById).stopped;
+}
+
+async function stopAllServices() {
+  const { portsById, cwdById, optsById } = serviceTargets();
+  return pm.stopAllAsync(portsById, cwdById, optsById);
+}
+
+function serviceTargets() {
   const portsById = {};
   const cwdById = {};
   const optsById = {};
@@ -40,8 +86,7 @@ function stopAllServices(sync = false) {
     cwdById[svc.id] = svc.run.cwd || '';
     optsById[svc.id] = { verify: svc.run.verify || [] };
   }
-  if (sync) return pm.stopAllSync(portsById, cwdById, optsById).stopped;
-  return pm.stopAll(portsById, cwdById, optsById);
+  return { portsById, cwdById, optsById };
 }
 
 function send(channel, payload) {
@@ -50,8 +95,36 @@ function send(channel, payload) {
   }
 }
 
-pm.onLog = (id, line) => send('proc:log', { id, line });
-pm.onExit = (id) => send('proc:exit', { id });
+// ---------- 日志推送批处理 ----------
+// 服务（尤其 DSH 的插件）可能每秒刷几百行；逐行发 IPC + 渲染层逐行重建 textContent
+// 会把渲染进程拖到无响应。这里按 100ms 合并成一次推送，渲染层一次 append。
+const LOG_FLUSH_MS = 100;
+const logBuf = new Map(); // id -> string[]
+let logTimer = null;
+
+function flushLogs() {
+  logTimer = null;
+  for (const [id, lines] of logBuf) {
+    if (!lines.length) continue;
+    const batch = lines.splice(0, lines.length);
+    send('proc:log', { id, lines: batch });
+  }
+}
+
+pm.onLog = (id, line) => {
+  let arr = logBuf.get(id);
+  if (!arr) {
+    arr = [];
+    logBuf.set(id, arr);
+  }
+  arr.push(line);
+  if (arr.length > 2000) arr.splice(0, arr.length - 2000); // 主进程侧兜底，防止刷屏撑爆内存
+  if (!logTimer) logTimer = setTimeout(flushLogs, LOG_FLUSH_MS);
+};
+pm.onExit = (id) => {
+  flushLogs(); // 先把残余日志推出去，渲染层才能看到「进程退出」这一行
+  send('proc:exit', { id });
+};
 
 // ---------- 配置读写（带备份 + 深路径 set） ----------
 function deepSet(obj, dottedPath, value) {
@@ -249,7 +322,9 @@ function registerIpc() {
   });
 
   // 服务列表 + 状态（全部探活并发，单个 600ms 超时，5 个服务最坏 ~0.6s 出全量结果）
-  ipcMain.handle('svc:list', async () => {
+  // 这是前端 2s 轮询的「实时状态」接口：detect 结果走 5 分钟缓存，端口探活是异步的，
+  // 所以稳定状态下这里不碰磁盘、不阻塞事件循环。
+  async function listStatus() {
     const list = buildServiceList();
     // DSH Web 入口：进程启动时 mint 的 token 只出现在启动日志里，
     // 这里把捕获到的 token 拼进 URL，避免用户首次点击 3080 被认证拦截后手动翻日志
@@ -266,13 +341,16 @@ function registerIpc() {
       list.map(async (svc) => {
         const entries = await Promise.all(svc.probePorts.map(async (p) => [p, await probePort(p, '127.0.0.1', 600)]));
         const ports = Object.fromEntries(entries);
-        const alive = pm.isRunning(svc.id) || (svc.probePorts.length > 0 && Object.values(ports).some(Boolean));
+        const managed = pm.isRunning(svc.id);
+        const alive = managed || (svc.probePorts.length > 0 && Object.values(ports).some(Boolean));
         return {
           id: svc.id,
           name: svc.name,
           desc: svc.desc,
           running: !!alive,
-          managed: pm.isRunning(svc.id),
+          managed,
+          pid: managed ? pm.getPid(svc.id) : 0,
+          uptimeMs: managed ? pm.getUptime(svc.id) : 0,
           ports,
           startable: svc.startable,
           blockedReason: svc.blockedReason,
@@ -282,12 +360,29 @@ function registerIpc() {
       })
     );
     return out;
+  }
+
+  ipcMain.handle('svc:list', () => listStatus());
+
+  // 手动刷新：强制重新扫描磁盘（组件目录可能被用户手动挪过 / 刚在外部装好）
+  // 先让出一次事件循环，渲染层能把按钮切成「扫描中…」再开始同步扫描
+  ipcMain.handle('svc:refresh', async () => {
+    await new Promise((r) => setImmediate(r));
+    invalidateDetect();
+    const list = await listStatus();
+    return { ok: true, list };
   });
 
   ipcMain.handle('svc:start', async (_e, id) => {
     const svc = buildServiceList().find((x) => x.id === id);
     if (!svc) return { ok: false, error: '未知服务' };
     if (!svc.startable) return { ok: false, error: svc.blockedReason || '无法启动' };
+    // 管理器已托管该服务 → 直接复用。必须先查托管表再看端口：
+    // 端口从 spawn 到 listen 有几百毫秒到数秒的空窗，只靠端口判断时连点两次「启动」会
+    // 拉起第二个进程（DSH 这类单实例应用的新进程会立刻退出，界面上表现为「启动失败」）。
+    if (pm.isRunning(id)) {
+      return { ok: true, reused: true, message: `${svc.name} 已在运行，已复用现有进程` };
+    }
     // 端口已在监听 = 已有实例在跑。DSH 是 Electron 单实例应用，重复启动的新进程会立刻退出
     // （退出码 0，界面上表现为"点了没反应/启动失败"）→ 直接复用，不再拉第二个进程
     if (svc.probePorts.length) {
@@ -311,10 +406,10 @@ function registerIpc() {
   ipcMain.handle('svc:stop', async (_e, id) => {
     const svc = buildServiceList().find((x) => x.id === id);
     // 先停附属服务，再停主服务（顺序反了容易留孤儿进程）
-    for (const c of (svc && svc.companions) || []) pm.stop(c.id);
+    for (const c of (svc && svc.companions) || []) await pm.stopAsync(c.id);
     // 必须传 verify：非托管实例（管理器没托管，靠端口/命令行反查）要靠身份特征确认归属。
     // 不传时 verify 为空 → 端口命中的进程一律被判「无法确认是本服务」→ 停止按钮永远失败。
-    const r = pm.stop(id, svc ? svc.probePorts : [], svc ? svc.run.cwd : '', {
+    const r = await pm.stopAsync(id, svc ? svc.probePorts : [], svc ? svc.run.cwd : '', {
       verify: (svc && svc.run.verify) || [],
     });
     // 等进程真正退出再返回，否则前端立刻刷新仍看到端口在线，状态反复跳
@@ -329,13 +424,13 @@ function registerIpc() {
     // 先判可启动性，再做停止：反过来的话，服务不可启动时会被停掉却起不来
     if (!svc.startable) return { ok: false, error: svc.blockedReason || '无法启动' };
 
-    for (const c of svc.companions || []) pm.stop(c.id);
+    for (const c of svc.companions || []) await pm.stopAsync(c.id);
 
     // 服务本来就没在运行时（崩溃过 / 首次启动），stop 会返回 notRunning。
     // 这不是错误，直接进启动分支。以前无条件当失败中止，导致「没运行 → 点重启 → 报停止失败」
     // → DSH 一旦崩过一次，重启按钮就永久失效。
     const verify = svc.run.verify || [];
-    const stopR = pm.stop(id, svc.probePorts, svc.run.cwd, { verify });
+    const stopR = await pm.stopAsync(id, svc.probePorts, svc.run.cwd, { verify });
     if (!stopR.ok && !stopR.notRunning) {
       return { ok: false, error: `停止失败，已中止重启：${stopR.error || '未知错误'}` };
     }
@@ -555,12 +650,58 @@ function registerIpc() {
     }
   });
   ipcMain.handle('shell:openPath', (_e, p) => shell.openPath(p));
-  ipcMain.handle('app:version', () => app.getVersion());
+  // 返回 { packaged, version }：开发版（未打包）不带版本号，渲染层据此隐藏版本行与更新入口
+  ipcMain.handle('app:version', () => {
+    const packaged = isReleaseBuild();
+    return { packaged, version: packaged ? managerVersion() : '' };
+  });
 
   // ---------- 自更新 ----------
   // 更新来源固定为 GitHub Releases（release.yml 在 push 时自动构建发布，tag 形如 "QQ-DSH-Manager vX.X.X"），
   // 不再需要手动填写更新清单地址。
   const MANAGER_RELEASE_API = 'https://api.github.com/repos/Serein1202/QQ-DSH-Manager/releases/latest';
+  const MANAGER_RELEASE_PAGE = 'https://github.com/Serein1202/QQ-DSH-Manager/releases/latest';
+
+  // 从网页版 releases/latest 拿到最终 tag URL（不读 body，避免下载整页 HTML）。
+  // 这条路不消耗 API 限额，用来在 API 被限流（HTTP 403）时兜底判断「有没有新版本」。
+  // 注意 Electron 的 net.fetch 不支持 redirect:'manual'（会抛 "Redirect was cancelled"），
+  // 所以这里让它正常跟随跳转，再从 res.url 里取 tag。
+  // tag 命名是 "QQ-DSH-Manager-v1.0.10"，前缀不一定以 v 开头，所以只认 /releases/tag/ 之后的部分。
+  const TAG_SEG = /\/releases\/tag\/([^/?#]+)/;
+  function versionFromTagUrl(url) {
+    const m = String(url || '').match(TAG_SEG);
+    if (!m) return '';
+    const v = m[1].match(/(\d+)\.(\d+)\.(\d+)/);
+    return v ? v.slice(1, 4).join('.') : '';
+  }
+
+  async function fetchReleaseTagUrl(url) {
+    try {
+      const { net } = require('electron');
+      if (net && typeof net.fetch === 'function') {
+        const res = await net.fetch(url, { headers: { 'User-Agent': 'QQ-DSH-Manager/' + managerVersion() } });
+        const finalUrl = res.url || '';
+        try {
+          if (res.body && typeof res.body.cancel === 'function') await res.body.cancel();
+        } catch {}
+        if (TAG_SEG.test(finalUrl)) return finalUrl;
+      }
+    } catch (e) {
+      if (process.env.QDM_DEBUG_UPDATE) console.error('[update] net.fetch(tag) 失败:', e && e.message);
+    }
+    // 回退：裸 https，不跟随跳转，直接读 302 的 Location
+    const https = require('https');
+    return new Promise((resolve) => {
+      const req = https.get(url, { headers: { 'User-Agent': 'QQ-DSH-Manager/' + managerVersion() } }, (res) => {
+        res.resume();
+        const loc = res.headers.location || '';
+        resolve(TAG_SEG.test(loc) ? loc : '');
+      });
+      req.on('error', () => resolve(''));
+      req.setTimeout(12000, () => { req.destroy(); resolve(''); });
+    });
+  }
+
 
   // GitHub 加速候选：配置了镜像前缀只走镜像；未配置先直连官方，失败自动换内置镜像兜底
   function releaseApiCandidates() {
@@ -577,13 +718,37 @@ function registerIpc() {
   }
 
   // 拉取 latest release 并解析出版本号与安装包资产（逐个候选源尝试，全失败才抛错）
+  // 请求优先走 Chromium 网络栈（net.fetch）：它继承系统代理 / PAC 设置，
+  // 而 downloader.js 里的裸 https.get 只支持直连——在必须走代理的网络里直连只会拿到
+  // ECONNRESET / 超时，旧实现下表现就是「检查更新失败：read ECONNRESET」。
+  // net 不可用（或该 URL 走不通）时再回退到裸 https，保证两种网络环境都能覆盖。
+  async function fetchReleaseJson(url) {
+    try {
+      const { net } = require('electron');
+      if (net && typeof net.fetch === 'function') {
+        const res = await net.fetch(url, {
+          headers: { 'User-Agent': 'QQ-DSH-Manager/' + managerVersion(), Accept: 'application/vnd.github+json' },
+        });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        return await res.json();
+      }
+    } catch (e) {
+      // 落到下面用裸 https 再试一次
+      if (process.env.QDM_DEBUG_UPDATE) console.error('[update] net.fetch 失败:', e && e.message);
+    }
+    return fetchJson(url);
+  }
+
   async function fetchManagerRelease() {
     let lastErr = null;
     for (const apiUrl of releaseApiCandidates()) {
       try {
-        const m = await fetchJson(apiUrl);
+        const m = await fetchReleaseJson(apiUrl);
         const tag = String(m.tag_name || '');
         const ver = (tag.match(/(\d+)\.(\d+)\.(\d+)/) || []).slice(1, 4).join('.');
+        // 解析不出三位版本号就当作这次失败，继续试下一个源。
+        // 否则 version='' 会让 cmpVer 全按 0 处理，结果永远是「已是最新」，用户完全看不出异常。
+        if (!ver) throw new Error('Release 标签里没有版本号：' + (tag || '(空)'));
         const assets = (m.assets || []).map((a) => ({ name: a.name || '', url: a.browser_download_url || '' }));
         const find = (re) => { const a = assets.find((x) => re.test(x.name)); return a ? a.url : ''; };
         return {
@@ -598,16 +763,35 @@ function registerIpc() {
         lastErr = e;
       }
     }
+    // 全部 API 源都失败时（最常见原因：未认证 API 限额 60 次/小时/IP，共享出口 IP 很容易打满，
+    // 返回 HTTP 403），退回网页版 releases/latest 的 302 跳转，从 Location 里取 tag。
+    // 这条路不走 API、没有速率限制，足以判断「有没有新版本」；代价是拿不到资产直链，
+    // 前端会退回到打开 Release 页面让用户手动下载。
+    try {
+      const tagUrl = await fetchReleaseTagUrl(MANAGER_RELEASE_PAGE);
+      const ver = versionFromTagUrl(tagUrl);
+      if (ver) {
+        return { version: ver, installer: '', portable: '', zip: '', page: tagUrl, notes: '' };
+      }
+    } catch (e) {
+      lastErr = lastErr || e;
+    }
     throw lastErr || new Error('获取最新版本失败');
   }
 
   ipcMain.handle('update:check', async () => {
+    // 开发版（未打包）不检查更新：源码运行的版本号没有发布语义，
+    // 拿它跟 Release 比只会得到「已是最新」或「要更新到比自己旧」的荒唐结论。
+    if (!isReleaseBuild()) {
+      return { configured: false, packaged: false, ok: false, error: '开发版不支持检查更新' };
+    }
     try {
       const rel = await fetchManagerRelease();
-      const current = app.getVersion();
+      const current = managerVersion();
       const latest = rel.version;
       return {
         configured: true,
+        packaged: true,
         ok: true,
         current,
         latest,
@@ -619,7 +803,7 @@ function registerIpc() {
         notes: rel.notes,
       };
     } catch (e) {
-      return { configured: true, ok: false, error: e.message };
+      return { configured: true, packaged: true, ok: false, error: e.message };
     }
   });
 
@@ -646,6 +830,8 @@ function registerIpc() {
     return '';
   }
   ipcMain.handle('update:install', async (_e, { url }) => {
+    // 开发版没有可替换的安装目录，直接拒绝，避免半路写坏 update-new
+    if (!isReleaseBuild()) return { ok: false, error: '开发版不支持自动更新' };
     try {
       const rel = await fetchManagerRelease();
       const allowed = [rel.zip, rel.installer, rel.portable].filter(Boolean);
@@ -730,6 +916,7 @@ function registerIpc() {
 
   // 退出时按设置清理：崩溃自动重启（连续失败退避 + 恢复附属服务）
   pm.onExit = (id) => {
+    flushLogs(); // 先推残余日志，渲染层才能看到「进程退出」这一行
     send('proc:exit', { id });
     const auto = settings().autoRestart;
     if (!auto || !auto[id]) return;
@@ -761,4 +948,4 @@ function registerIpc() {
   };
 }
 
-module.exports = { registerIpc, pm, stopAllServices };
+module.exports = { registerIpc, pm, stopAllServices, stopAllServicesSync };

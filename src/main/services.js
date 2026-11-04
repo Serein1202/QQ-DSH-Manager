@@ -93,8 +93,15 @@ function buildServiceList() {
         // 只要是拿 DSH 的 Electron 本体执行 JS（不管入口在 asar 内还是磁盘上），
         // 都必须 ELECTRON_RUN_AS_NODE=1，否则它会当成桌面应用去开窗口而不是执行 CLI
         env: /\.exe"/i.test(cmd) ? { ELECTRON_RUN_AS_NODE: '1' } : {},
-        // 停止时用于确认进程身份（端口反查防误杀）：exe 名或 CLI 特征
-        verify: [dshExe ? path.basename(dshExe) : '', '--expose-internals'].filter(Boolean),
+        // 停止时用于确认进程身份（端口反查防误杀）：exe 名、CLI 入口、--expose-internals
+        // 必须带 CLI 路径特征：本机存在用系统 node 直跑 `@deepseek-ai/dsh/lib/bin.js web`
+        // 的外部实例（如手动/脚本启动），命令行里既没有 exe 名也没有 --expose-internals，
+        // 只按前两条判断会把它当成「无关进程」→ 停止被拒 → 重启中止。
+        verify: [
+          dshExe ? path.basename(dshExe) : '',
+          '--expose-internals',
+          path.join('@deepseek-ai', 'dsh', 'lib', 'bin.js'),
+        ].filter(Boolean),
       },
       probePorts: [dshPort],
       webLinks: [{ label: 'DSH Web API', url: `http://127.0.0.1:${dshPort}`, port: dshPort }],

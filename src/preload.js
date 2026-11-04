@@ -8,6 +8,7 @@ const { contextBridge, ipcRenderer } = require('electron');
 const INVOKE_CHANNELS = new Set([
   'detect:all',
   'svc:list',
+  'svc:refresh',
   'svc:start',
   'svc:stop',
   'svc:logs',

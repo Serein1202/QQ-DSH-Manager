@@ -130,11 +130,17 @@ function versionOk(v, minMajor, minMinor = 0) {
   return maj > minMajor || (maj === minMajor && min >= minMinor);
 }
 
-// detectAll 结果缓存 15s：svc:list 每 2.5s 轮询一次，不能每次都全盘扫磁盘
+// 检测结果缓存。为什么不是 15 秒：
+// detectAll 是纯同步的全盘目录扫描（多个扫描根 × BFS 2 层 readdirSync），在用户目录大的机器上
+// 一次要几百毫秒到几秒。而 svc:list / 底部状态栏都在轮询它，TTL 一过就在主进程同步扫一遍，
+// 表现就是「每隔十几秒界面卡一下」。改成 5 分钟，并只在真正需要时强制失效
+// （手动"刷新"、安装完成、改设置）。
+const DETECT_TTL = 5 * 60 * 1000;
 let _cache = null;
 let _cacheAt = 0;
-function detectAll() {
-  if (_cache && Date.now() - _cacheAt < 15000) return _cache;
+function detectAll(opts) {
+  if (opts && opts.force) _cache = null;
+  if (_cache && Date.now() - _cacheAt < DETECT_TTL) return _cache;
   _cache = detectAllImpl();
   _cacheAt = Date.now();
   return _cache;

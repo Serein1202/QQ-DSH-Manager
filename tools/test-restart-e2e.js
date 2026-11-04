@@ -45,8 +45,12 @@ const fakeElectron = {
   shell: { openExternal: async () => {}, openPath: async () => '' },
   app: {
     getPath: () => TMP,
+    // 故意模拟「非标准启动方式」下 app.getVersion() 的退化行为：
+    // 应用根目录里没有 package.json 时 Electron 会返回自身版本（如 33.4.11）。
+    // 版本号绝对不能直接信它，否则界面显示 33.4.11 且更新检查永远判定「已是最新」。
+    getAppPath: () => TMP,
     isPackaged: false,
-    getVersion: () => '1.0.4',
+    getVersion: () => '33.4.11',
     quit: () => {},
   },
 };
@@ -171,6 +175,100 @@ async function main() {
     ok('第二次启动识别为复用而非新开', r2.ok === true && r2.reused === true, JSON.stringify(r2));
     await call('svc:stop', 'dsh');
     await sleep(300);
+  }
+
+  console.log('\n== 用例 E：外部实例命令行只有 CLI 路径特征时，必须能被停掉 ==');
+  {
+    // 复现本机场景：`node ... @deepseek-ai/dsh/lib/bin.js web`，命令行里既没有 exe 名
+    // 也没有 --expose-internals。旧 verify 只认前两条 → 判定「无法确认是本服务」→ 重启中止。
+    const cliRel = path.join('@deepseek-ai', 'dsh', 'lib', 'bin.js');
+    const cliDir = path.join(TMP, 'cli', 'dsh', 'node_modules', path.dirname(cliRel));
+    fs.mkdirSync(cliDir, { recursive: true });
+    const cliBin = path.join(cliDir, 'bin.js');
+    const PORT_E = PORT + 2;
+    fs.writeFileSync(cliBin, `require('net').createServer(()=>{}).listen(${PORT_E},'127.0.0.1');setInterval(()=>{},1000);`, 'utf8');
+
+    const ext = spawn(NODE, [cliBin, 'web', '--port', String(PORT_E)], { cwd: TMP, stdio: 'ignore', windowsHide: true });
+    ok('外部 CLI 实例已启动', await waitPort(PORT_E), `pid=${ext.pid}, bin=${cliBin}`);
+
+    // 换成 services.js 里 DSH 的真实 verify 组合（含 CLI 路径特征）。
+    // 注意：不能用 path.basename(NODE) 这种宽泛特征——"node.exe" 会命中本机所有 node 进程，
+    // 用例会把无关进程一起卷进来（真实的 DSH verify 是 "DeepSeek Harness.exe"，
+    // 不会和普通 node 进程撞车）。
+    stubSvc.probePorts = [PORT_E];
+    stubSvc.run.verify = [cliRel, '--dsh-e2e-marker'];
+    const r = await call('svc:stop', 'dsh');
+    ok('stop 返回 ok（不再报「无法确认是本服务」）', r.ok === true, JSON.stringify(r));
+    await sleep(500);
+    ok('外部 CLI 进程已被杀掉', !isPidAlive(ext.pid));
+    try { ext.kill(); } catch {}
+
+    // 还原桩，后续用例继续用原端口
+    stubSvc.probePorts = [PORT];
+    stubSvc.run.verify = ['--expose-internals'];
+  }
+
+  console.log('\n== 用例 F：重启期间主进程不能被阻塞（点重启不卡死） ==');
+  {
+    await call('svc:start', 'dsh');
+    await waitPort(PORT);
+    // 每 50ms 打点，记录事件循环被同步调用卡住的最大间隔。
+    // 旧实现走 spawnSync（netstat + 最多 4 次 PowerShell），实测会卡 3~10s。
+    let maxGap = 0;
+    let last = Date.now();
+    const iv = setInterval(() => {
+      const now = Date.now();
+      maxGap = Math.max(maxGap, now - last);
+      last = now;
+    }, 50);
+    const r = await call('svc:restart', 'dsh');
+    clearInterval(iv);
+    ok('restart 返回 ok', r.ok === true, JSON.stringify(r));
+    ok('事件循环最大停顿 < 800ms（不再整窗卡死）', maxGap < 800, `maxGap=${maxGap}ms`);
+    await call('svc:stop', 'dsh');
+    await sleep(300);
+  }
+
+  console.log('\n== 用例 G：状态接口带上 pid / 运行时长，刷新接口可用 ==');
+  {
+    const r0 = await call('svc:start', 'dsh');
+    ok('启动成功', r0.ok === true, JSON.stringify(r0));
+    await sleep(400);
+    const list = await call('svc:list');
+    const s = list.find((x) => x.id === 'dsh');
+    ok('svc:list 返回 pid', !!s && s.pid > 0, JSON.stringify(s && { pid: s.pid }));
+    ok('svc:list 返回运行时长', !!s && s.uptimeMs >= 0, JSON.stringify(s && { up: s.uptimeMs }));
+    const rr = await call('svc:refresh');
+    ok('svc:refresh 返回新列表', rr.ok === true && Array.isArray(rr.list) && rr.list.length === 1, JSON.stringify(rr && { n: rr.list && rr.list.length }));
+    await call('svc:stop', 'dsh');
+    await sleep(300);
+  }
+
+  console.log('\n== 用例 H：开发版不暴露版本号/不查更新，打包版才显示 ==');
+  {
+    // 桩里 app.getVersion() 返回 '33.4.11'（模拟 electron <入口文件> 启动时的退化值），
+    // app.getAppPath() 指向无 package.json 的临时目录 —— 两条「正常来源」都拿不到版本，
+    // 只能靠 __dirname 上溯两级读到本项目的 package.json。
+    const real = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version;
+
+    // --- 开发版（app.isPackaged === false）---
+    fakeElectron.app.isPackaged = false;
+    const dv = await call('app:version');
+    ok('开发版 packaged=false', dv && dv.packaged === false, JSON.stringify(dv));
+    ok('开发版不返回版本号', dv && dv.version === '', JSON.stringify(dv));
+    const du = await call('update:check');
+    ok('开发版不检查更新', du && du.ok === false && du.packaged === false, JSON.stringify(du));
+    ok('开发版错误信息可读', /开发版/.test(String(du && du.error)), String(du && du.error));
+
+    // --- 打包版（app.isPackaged === true）---
+    fakeElectron.app.isPackaged = true;
+    const pv = await call('app:version');
+    ok('打包版 packaged=true', pv && pv.packaged === true, JSON.stringify(pv));
+    ok('打包版版本号等于项目 package.json', pv && pv.version === real, `got=${pv && pv.version} want=${real}`);
+    ok('没有退化成 Electron 版本', pv && pv.version !== fakeElectron.app.getVersion(), `got=${pv && pv.version}`);
+    ok('三段式版本号', /^\d+\.\d+\.\d+$/.test(String(pv && pv.version)), `got=${pv && pv.version}`);
+
+    fakeElectron.app.isPackaged = false; // 还原，避免影响其它用例
   }
 
   console.log(`\n结果: ${pass} 通过 / ${fail} 失败`);

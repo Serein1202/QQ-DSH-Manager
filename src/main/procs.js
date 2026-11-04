@@ -8,6 +8,53 @@ const fs = require('fs');
 
 const LOG_LIMIT = 1000; // 每服务保留最近 1000 行
 
+// ---------- 异步执行器 ----------
+// 为什么必须有它：主进程里所有 spawnSync 都会阻塞 Electron 的事件循环。
+// restart 一次要跑 netstat + 最多 4 个 PowerShell + taskkill，同步执行累计 3~10s，
+// 期间窗口不派发消息 → Windows 判定「未响应」（用户看到的就是「点重启客户端卡死」）。
+// 统一走 spawn 回调，主进程全程可响应，渲染层的进度/状态刷新也不会被冻住。
+// 超时用 kill 兜底（Windows 下等价 TerminateProcess），返回 status=-1 表示失败，不抛异常。
+const MAX_OUT = 4 * 1024 * 1024; // 输出上限，防止异常进程刷爆内存
+
+function runAsync(cmd, args, timeout = 8000) {
+  return new Promise((resolve) => {
+    let out = '';
+    let err = '';
+    let done = false;
+    let child = null;
+    const finish = (r) => {
+      if (done) return;
+      done = true;
+      try {
+        if (child) child.kill();
+      } catch {}
+      resolve(r);
+    };
+    try {
+      child = spawn(cmd, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch (e) {
+      return resolve({ status: -1, stdout: '', stderr: e.message });
+    }
+    const timer = setTimeout(() => finish({ status: -1, stdout: out, stderr: 'timeout' }), timeout);
+    if (child.stdout)
+      child.stdout.on('data', (b) => {
+        if (out.length < MAX_OUT) out += b.toString('utf8');
+      });
+    if (child.stderr)
+      child.stderr.on('data', (b) => {
+        if (err.length < MAX_OUT) err += b.toString('utf8');
+      });
+    child.on('error', (e) => {
+      clearTimeout(timer);
+      finish({ status: -1, stdout: out, stderr: e.message });
+    });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      finish({ status: code, stdout: out, stderr: err });
+    });
+  });
+}
+
 // PID 是否仍存活。process.kill(pid, 0) 只做句柄探测不发送信号：
 //   ESRCH = 进程已不存在；EPERM = 存在但无权限打开（受保护进程）→ 仍算存活。
 function isPidAlive(pid) {
@@ -219,6 +266,126 @@ function killPidTree(pid) {
   }
 }
 
+async function killPidTreeAsync(pid) {
+  const r = await runAsync('taskkill', ['/PID', String(pid), '/T', '/F'], 8000);
+  return r.status === 0;
+}
+
+// ---------- 异步版进程反查（stopAsync 用） ----------
+// 把「netstat 查端口 + PowerShell 查命令行」压成 ≤2 次子进程：
+// 旧实现是 1 次 netstat + 每个特征各 1 次 PowerShell（cwd、exe 名、--expose-internals 共 4 次），
+// 每次 PowerShell 冷启动 0.5~3s，串起来就是 5~10s 的整机卡顿。
+// 现在一次 CIM 枚举同时返回「端口命中的 PID」和「命令行命中特征的 PID」，用 idx 区分来源：
+//   idx >= 0  → 命令行命中第 idx 个 needle（身份弱，必须 verify 再确认）
+//   idx = -2  → 端口命中（身份强，反查不到命令行时按端口归属处理）
+async function scanAsync({ ports = [], needles = [] } = {}) {
+  const portPids = new Set();
+  const list = (ports || []).map(Number).filter((n) => n > 0 && n < 65536);
+  if (list.length) {
+    const r = await runAsync('netstat', ['-ano', '-p', 'TCP'], 6000);
+    const suffixes = list.map((p) => ':' + p);
+    for (const line of String(r.stdout || '').split(/\r?\n/)) {
+      const cols = line.trim().split(/\s+/);
+      if (cols.length < 5 || cols[0] !== 'TCP' || !/LISTENING/i.test(cols[3])) continue;
+      if (!suffixes.some((s) => cols[1].endsWith(s))) continue;
+      const pid = Number(cols[4]);
+      if (pid > 4 && pid !== process.pid) portPids.add(pid);
+    }
+    // 兜底：netstat 视图被过滤/失败时改用 CIM 的监听连接（同样一次调用）
+    if (!portPids.size) {
+      const ps = await runAsync(
+        'powershell.exe',
+        [
+          '-NoProfile',
+          '-NonInteractive',
+          '-Command',
+          `(Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Where-Object { @(${list.join(',')}) -contains $_.LocalPort } | Select-Object -ExpandProperty OwningProcess -Unique) -join ','`,
+        ],
+        8000
+      );
+      for (const s of String(ps.stdout || '').trim().split(',')) {
+        const pid = Number(s);
+        if (pid > 4 && pid !== process.pid) portPids.add(pid);
+      }
+    }
+  }
+
+  const nd = (needles || []).map((n) => String(n || '').trim()).filter(Boolean);
+  const ids = [...portPids];
+  const infoMap = new Map();
+  const cmdPids = new Set();
+  if (!ids.length && !nd.length) return { portPids, cmdPids, infoMap };
+
+  // needle 走单引号字面量：PowerShell 里 ' 需要写成 '' 转义
+  const needleLit = nd.map((n) => "'" + n.replace(/'/g, "''") + "'").join(',');
+  const script = [
+    `$ids=@(${ids.join(',')});`,
+    `$needles=@(${needleLit});`,
+    'Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | ForEach-Object {',
+    '  $p=$_; if ($p.ProcessId -le 4 -or $p.ProcessId -eq $PID) { return }',
+    '  $idx=-1;',
+    '  if ($ids -contains $p.ProcessId) { $idx=-2 }',
+    '  if ($idx -eq -1) {',
+    '    for ($i=0; $i -lt $needles.Count; $i++) {',
+    "      if ($needles[$i] -and $p.CommandLine -like ('*'+$needles[$i]+'*')) { $idx=$i; break }",
+    '    }',
+    '  }',
+    '  if ($idx -ne -1) { "$($p.ProcessId)|$idx|$($p.CommandLine)" }',
+    '}',
+  ].join(' ');
+  const r = await runAsync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], 15000);
+  for (const line of String(r.stdout || '').split(/\r?\n/)) {
+    const i1 = line.indexOf('|');
+    if (i1 <= 0) continue;
+    const i2 = line.indexOf('|', i1 + 1);
+    if (i2 < 0) continue;
+    const pid = Number(line.slice(0, i1));
+    if (!(pid > 4) || pid === process.pid) continue;
+    const idx = Number(line.slice(i1 + 1, i2));
+    if (!Number.isFinite(idx)) continue;
+    infoMap.set(pid, line.slice(i2 + 1));
+    if (idx >= 0) cmdPids.add(pid);
+  }
+  return { portPids, cmdPids, infoMap };
+}
+
+// 由「端口命中 / 命令行命中 / 命令行」决定要杀谁。同步与异步路径共用，避免两套判定漂移。
+// 防误杀与防漏杀的平衡：
+// - 端口命中的 PID：反查不到命令行（权限/僵尸）时信任端口归属，避免漏杀；
+//   反查到且明确不含 verify 特征时视为无关进程放过。
+// - 命令行兜底命中的 PID：特征较宽泛，必须 verify 确认身份才杀。
+function decideTargets(portPids, cmdPids, infoMap, verify) {
+  // 自杀保护：不能把管理器自己（或它的父进程）杀掉。
+  //
+  // 判据只能是「自身进程号」+「打包运行时唯一的 exe 路径」两者组合，不能拿 process.execPath 无条件比对：
+  // - 打包态 Electron：execPath 就是 QQ-DSH-Manager.exe，命令行里出现它即等同自身，安全；
+  // - 开发态 Electron（electron .）：execPath 是共享的 electron.exe；
+  // - 纯 node 运行（命令行 / 测试 / 被当作 runtime 复用时）：execPath 是共享的 node.exe。
+  // 后两种情形下 if(cmd.includes(execPath)) 会把「所有用同一 node 启动的托管服务」判成自身，
+  // 造成非托管实例永远停不掉（端口有进程 → foreign 为空 → 报「无法确认是本服务」）。
+  const electron = !!(process.versions && process.versions.electron);
+  const selfExe = electron && !process.defaultApp ? process.execPath || '' : '';
+  const safe = (pid) => {
+    if (pid === process.pid || pid === process.ppid) return false;
+    const cmd = infoMap.get(pid);
+    if (selfExe && cmd && cmd.includes(selfExe)) return false;
+    return true;
+  };
+  const targets = [];
+  for (const pid of portPids) {
+    if (!safe(pid)) continue;
+    const cmd = infoMap.get(pid);
+    if (cmd === undefined || cmd === '') targets.push({ pid });
+    else if (verify.length && verify.some((v) => v && cmd.includes(v))) targets.push({ pid });
+  }
+  for (const pid of cmdPids) {
+    if (portPids.has(pid) || !safe(pid)) continue;
+    const cmd = infoMap.get(pid);
+    if (cmd && verify.length && verify.some((v) => v && cmd.includes(v))) targets.push({ pid });
+  }
+  return targets;
+}
+
 class ProcessManager {
   constructor() {
     this.procs = new Map(); // id -> ChildProcess
@@ -228,10 +395,22 @@ class ProcessManager {
     this.onLog = null; // (id, line) => void
     this.userStopped = new Set(); // 用户主动 stop 的 id：退出时不算崩溃，不触发自动重启
     this.restartStats = new Map(); // id -> { count, timer } 崩溃自动重启计数（60s 窗口退避）
+    this.startedAt = new Map(); // id -> 启动时间戳，用于前端显示运行时长
   }
 
   getWebToken(id) {
     return this.webTokens.get(id) || '';
+  }
+
+  // 托管进程的 PID / 运行时长，供服务列表实时显示
+  getPid(id) {
+    const p = this.procs.get(id);
+    return p && p.pid ? p.pid : 0;
+  }
+
+  getUptime(id) {
+    const t = this.startedAt.get(id);
+    return t ? Date.now() - t : 0;
   }
 
   clearCrash(id) {
@@ -331,6 +510,7 @@ class ProcessManager {
     }
 
     this.procs.set(id, child);
+    this.startedAt.set(id, Date.now());
     // 新进程启动：上一次运行 mint 的 token 立即作废（DSH 每次启动都换 token）。
     // 不清掉会让 svc:list 把过期 token 拼进 Web 入口，点开直接 401 —— 这就是重启后「打不开」的来源。
     this.webTokens.delete(id);
@@ -369,6 +549,7 @@ class ProcessManager {
       if (current === child) {
         this.procs.delete(id);
         this.webTokens.delete(id); // 进程已死，token 一定失效，不能留给前端拼 URL
+        this.startedAt.delete(id);
       }
       // 用户主动停止导致的退出不算崩溃：不触发自动重启，也不累计崩溃计数
       if (this.userStopped.has(id)) {
@@ -394,6 +575,7 @@ class ProcessManager {
         if (r.status === 0) {
           this.procs.delete(id);
           this.webTokens.delete(id); // 进程已停止，token 失效
+          this.startedAt.delete(id);
           this.pushLog(id, `[${new Date().toLocaleTimeString()}] 已停止`);
           // 把 PID 交回调用方，由 waitStopped 确认真正退出（taskkill 返回 0 ≠ 已终止）
           return { ok: true, pids: [p.pid] };
@@ -425,28 +607,9 @@ class ProcessManager {
     const pids = new Set([...portPids, ...cmdPids]);
     if (!pids.size) return { ok: false, notRunning: true, error: '服务未在运行' };
 
-    // 防误杀与防漏杀的平衡：
-    // - 端口命中的 PID：端口是服务自己的 probePorts，命中即视为本服务；命令行反查失败（权限/僵尸）
-    //   或反查为空时不放过，直接纳入停止，避免停不掉旧实例；若命令行可反查到且明确不含 verify
-    //   特征，则视为无关进程放过。
-    // - 命令行兜底命中的 PID：特征较宽泛，仍需 verify 确认身份才杀。
     const verify = (opts && opts.verify) || [];
     const infoMap = new Map(pidsInfo([...pids]).map((i) => [i.pid, i.cmdline]));
-    const targets = [];
-    for (const pid of portPids) {
-      const cmd = infoMap.get(pid);
-      if (cmd === undefined || cmd === '') {
-        targets.push({ pid }); // 端口命中但反查不到命令行：信任端口归属，避免漏杀
-      } else if (verify.length && verify.some((v) => v && cmd.includes(v))) {
-        targets.push({ pid });
-      }
-      // 端口命中但命令行明确不含 verify 特征：视为无关进程占用端口，放过（防误杀）
-    }
-    for (const pid of cmdPids) {
-      if (portPids.has(pid)) continue; // 已在端口命中分支处理
-      const cmd = infoMap.get(pid);
-      if (cmd && verify.length && verify.some((v) => v && cmd.includes(v))) targets.push({ pid });
-    }
+    const targets = decideTargets(portPids, cmdPids, infoMap, verify);
     if (!targets.length) return { ok: false, error: '端口有进程但无法确认是本服务（已取消停止以避免误杀）' };
 
     const errors = [];
@@ -461,10 +624,80 @@ class ProcessManager {
       : { ok: true, pids: killed };
   }
 
+  // 异步版 stop：语义与 stop() 完全一致，但所有子进程调用都不阻塞主进程事件循环。
+  // IPC（svc:stop / svc:restart / svc:stopAll）必须走这个版本，否则点一次重启窗口会「未响应」5~10s。
+  // 同步版只留给 before-quit（同步钩子用不了 await）。
+  async stopAsync(id, ports = [], cwd = '', opts = {}) {
+    const p = this.procs.get(id);
+    if (p && p.pid) {
+      this.userStopped.add(id);
+      const ok = await killPidTreeAsync(p.pid);
+      if (ok) {
+        this.procs.delete(id);
+        this.webTokens.delete(id);
+        this.startedAt.delete(id);
+        this.pushLog(id, `[${new Date().toLocaleTimeString()}] 已停止`);
+        return { ok: true, pids: [p.pid] };
+      }
+      this.userStopped.delete(id);
+      return { ok: false, error: `taskkill 失败 (pid ${p.pid})` };
+    }
+
+    if ((!ports || !ports.length) && !cwd) {
+      return { ok: false, notRunning: true, error: '服务未在运行' };
+    }
+
+    // 与同步版同一套特征：cwd 在 Windows 命令行里不存在，实际起作用的是 verify（exe 名 / CLI 路径）
+    const needles = [cwd, ...((opts && opts.verify) || [])].filter(Boolean);
+    const { portPids, cmdPids, infoMap } = await scanAsync({ ports: ports || [], needles });
+    if (!portPids.size && !cmdPids.size) return { ok: false, notRunning: true, error: '服务未在运行' };
+
+    const verify = (opts && opts.verify) || [];
+    const targets = decideTargets(portPids, cmdPids, infoMap, verify);
+    if (!targets.length) {
+      // 带上占用者的 PID 和命令行，用户才知道是谁占着端口（原来只有一句模糊提示，没法排查）
+      const who = [...portPids]
+        .map((pid) => `pid ${pid}: ${(infoMap.get(pid) || '（无法读取命令行）').slice(0, 160)}`)
+        .join('；');
+      return {
+        ok: false,
+        error: '端口有进程但不属于本服务，已取消停止以避免误杀' + (who ? `（占用者 ${who}）` : ''),
+        foreign: who ? [...portPids] : [],
+      };
+    }
+
+    const killed = [];
+    const errors = [];
+    await Promise.all(
+      targets.map(async (t) => {
+        if (await killPidTreeAsync(t.pid)) killed.push(t.pid);
+        else errors.push(t.pid);
+      })
+    );
+    if (killed.length) this.webTokens.delete(id);
+    if (killed.length) this.startedAt.delete(id);
+    this.pushLog(id, `[${new Date().toLocaleTimeString()}] 已停止外部进程 (pid ${killed.join(', ')})`);
+    return errors.length
+      ? { ok: false, pids: killed, error: `部分进程停止失败: ${errors.join(', ')}` }
+      : { ok: true, pids: killed };
+  }
+
   async stopAll(portsById = {}, cwdById = {}, optsById = {}) {
     // 先同步下达所有 taskkill，再逐个等 PID 消失。
     // 不能边杀边等：await 会挂起循环，排在后面的服务就没机会被杀。
     const { stopped, pids } = this.stopAllSync(portsById, cwdById, optsById);
+    await this.waitStopped(pids);
+    return stopped;
+  }
+
+  // 异步批量停止（IPC / 界面按钮用）：并行下发，全部 await，主进程不卡
+  async stopAllAsync(portsById = {}, cwdById = {}, optsById = {}) {
+    const ids = [...new Set([...this.procs.keys(), ...Object.keys(portsById)])];
+    const results = await Promise.all(
+      ids.map((id) => this.stopAsync(id, portsById[id] || [], cwdById[id] || '', optsById[id] || {}))
+    );
+    const stopped = ids.filter((_, i) => results[i].ok);
+    const pids = results.flatMap((r) => r.pids || []);
     await this.waitStopped(pids);
     return stopped;
   }
@@ -519,4 +752,13 @@ function probePort(port, host = '127.0.0.1', timeout = 800) {
   });
 }
 
-module.exports = { ProcessManager, probePort, parseShellCmd, isPidAlive, makeLineReader };
+module.exports = {
+  ProcessManager,
+  probePort,
+  parseShellCmd,
+  isPidAlive,
+  makeLineReader,
+  runAsync,
+  scanAsync,
+  decideTargets,
+};

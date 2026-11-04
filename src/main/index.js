@@ -2,7 +2,7 @@
 'use strict';
 const { app, BrowserWindow } = require('electron');
 const path = require('path');
-const { registerIpc, stopAllServices } = require('./ipc');
+const { registerIpc, stopAllServicesSync } = require('./ipc');
 const { settings } = require('./store');
 
 let win = null;
@@ -39,6 +39,6 @@ app.on('before-quit', () => {
   // 按设置决定：关闭软件时是否停掉由本软件拉起的服务
   // 用同步版本：before-quit 是同步钩子，异步 stopAll 里的 await 会中断后续服务的停止
   if (settings().closeStopServices) {
-    stopAllServices(true);
+    stopAllServicesSync();
   }
 });
