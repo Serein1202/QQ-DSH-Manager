@@ -23,15 +23,23 @@ npm install          # 已配 npmmirror + electron 镜像，国内可直接装
 npm start            # 启动软件
 ```
 
-## 打包（两种都要就跑这一条）
+## 打包（只出 zip）
 
 ```bash
-npm run dist             # 同时产出 NSIS 安装器 + 便携版 exe
-npm run dist:installer   # 只出安装器
-npm run dist:portable    # 只出便携版
+npm run dist       # 产出 release/QQ-DSH-Manager-<版本>-win64.zip（解压即用目录）
+npm run dist:dir   # 只出解压目录 release/win-unpacked，不打 zip（本地验证用，快很多）
 ```
 
 产物在 `release/` 目录。
+
+不发 NSIS 安装器和单文件 portable exe，原因：
+
+- **单文件 exe** 每次运行都自解压到 `%TEMP%` 下的随机目录，程序真正运行的目录和你解压的目录不是同一个。软件内"检查更新"要按 exe 目录原地覆盖，结果覆盖不到正在运行的那份，新旧客户端并存，还可能出现关掉旧版发现没更新过的情况。
+- **NSIS 安装器**默认装到 `Program Files`，普通账户对该目录没有写权限，自动更新必然 `Permission denied`。
+
+zip 是就地解压运行，程序目录 == 你解压的目录，更新脚本能原地覆盖，链路才闭环。
+
+GitHub Actions（`.github/workflows/release.yml`）在 push 到 main 时自动递增 patch 版本号、打 zip、发 Release。
 
 ## 首次部署流程（小白视角）
 
@@ -66,7 +74,7 @@ node tools/extract-dsh-cli.js
 ```
 QQ-DSH-Manager/
 ├── package.json               # electron + electron-builder
-├── electron-builder.yml       # nsis + portable 双打包配置
+├── electron-builder.yml       # 打包配置（只出 zip）
 ├── .npmrc                     # npmmirror 镜像
 └── src/
     ├── preload.js             # contextBridge 安全桥

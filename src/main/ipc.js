@@ -15,7 +15,7 @@ const pm = new ProcessManager();
 const downloads = new Map(); // key -> { running: true } 防重复下载
 
 // ---------- 版本号 ----------
-// 约定：只有打包产物（Release 下载的安装版/便携版）才对外暴露版本号与更新检测；
+// 约定：只有打包产物（Release 下载的 zip 解压版）才对外暴露版本号与更新检测；
 // 源码运行（app.isPackaged === false，含 npm start / 启动.bat / electron <入口>）一律视为开发版，
 // 界面不显示版本号、不提供更新入口 —— 开发版没有稳定的版本语义，暴露出来只会误导（见下方 getVersion 退化问题）。
 //
@@ -751,10 +751,11 @@ function registerIpc() {
         if (!ver) throw new Error('Release 标签里没有版本号：' + (tag || '(空)'));
         const assets = (m.assets || []).map((a) => ({ name: a.name || '', url: a.browser_download_url || '' }));
         const find = (re) => { const a = assets.find((x) => re.test(x.name)); return a ? a.url : ''; };
+        // Release 只发 zip（解压即用的完整目录），不再有 exe 资产：
+        // 单文件 portable exe 运行时会自解压到 %TEMP% 随机目录，程序真正所在目录和用户解压目录不一致，
+        // 自动更新按 exe 所在目录覆盖会打空；NSIS 装在 Program Files 又需要管理员权限才能写。
         return {
           version: ver,
-          installer: find(/\.exe$/i),
-          portable: find(/\.zip$/i),
           zip: find(/\.zip$/i),
           page: m.html_url || '',
           notes: m.body || '',
@@ -771,7 +772,7 @@ function registerIpc() {
       const tagUrl = await fetchReleaseTagUrl(MANAGER_RELEASE_PAGE);
       const ver = versionFromTagUrl(tagUrl);
       if (ver) {
-        return { version: ver, installer: '', portable: '', zip: '', page: tagUrl, notes: '' };
+        return { version: ver, zip: '', page: tagUrl, notes: '' };
       }
     } catch (e) {
       lastErr = lastErr || e;
@@ -796,8 +797,6 @@ function registerIpc() {
         current,
         latest,
         newer: cmpVer(latest, current) > 0,
-        installer: rel.installer,
-        portable: rel.portable,
         zip: rel.zip,
         page: rel.page,
         notes: rel.notes,
@@ -807,9 +806,10 @@ function registerIpc() {
     }
   });
 
-  // 下载新版 zip 到固定根目录，解压到 update-new，写替换脚本分离重启（替代直接运行 portable exe：
-  // portable 每次解压到 Temp 随机目录无法原地覆盖，导致新旧客户端并存）
-  // 收紧：仅允许下载当前 latest release 的资产，扩展名必须是 .zip，执行前弹确认
+  // 下载新版 zip 到程序目录，解压到 update-new，写替换脚本分离重启：
+  // zip 是就地解压运行，程序目录 == 用户解压目录，xcopy 能原地覆盖。
+  // 这也是 Release 不再发 portable exe / NSIS 安装器的原因（前者程序目录不可预测，后者不可写）。
+  // 收紧：仅允许下载当前 latest release 的 zip 资产，扩展名必须是 .zip，执行前弹确认
   // 在解压目录里找主程序 exe（跳过卸载器，最多 2 层）
   function findMainExe(dir, maxDepth) {
     const queue = [[dir, 0]];
@@ -834,7 +834,9 @@ function registerIpc() {
     if (!isReleaseBuild()) return { ok: false, error: '开发版不支持自动更新' };
     try {
       const rel = await fetchManagerRelease();
-      const allowed = [rel.zip, rel.installer, rel.portable].filter(Boolean);
+      // 只认当前 latest release 的 zip。Release 不再提供 exe，所以白名单里也就没有 installer/portable。
+      const allowed = [rel.zip].filter(Boolean);
+      if (!allowed.length) return { ok: false, error: '最新 Release 里没有 zip 资产' };
       if (!url || !allowed.includes(url)) return { ok: false, error: '仅允许下载官方 Release 资产' };
       let destPath = '';
       try {
@@ -852,7 +854,21 @@ function registerIpc() {
         defaultId: 0,
       });
       if (ans.response !== 0) return { ok: false, error: '已取消更新' };
-      const root = defaultScanRoot();
+      // 替换目标必须是「程序自己所在的目录」，不能用 defaultScanRoot()：
+      // 高级设置允许把 scanRoot 改成放组件的目录，它和程序目录不是一回事，
+      // 按它覆盖等于把新版写进别人的目录，程序本身还是旧的。
+      const root = path.dirname(app.getPath('exe'));
+      // 提前验证可写：解压到一半才发现 Permission denied，会留下半残的 update-new
+      try {
+        const probe = path.join(root, '.cm-write-probe');
+        fs.writeFileSync(probe, '');
+        fs.unlinkSync(probe);
+      } catch {
+        return {
+          ok: false,
+          error: `程序目录没有写权限，无法自动更新：${root}\n把整个目录移到用户目录（例如 D:\\QQ-DSH-Manager）后重试，或手动下载新 zip 覆盖。`,
+        };
+      }
       const zipDest = path.join(root, 'cm-update.zip');
       const stage = path.join(root, 'update-new');
       // 多源回退：直连失败自动切镜像；网络中断时 .part 保留，换源后从断点继续

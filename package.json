@@ -7,12 +7,12 @@
   "license": "MIT",
   "scripts": {
     "start": "electron .",
-    "test": "node tools/test-restart.js && node tools/test-restart-e2e.js",
+    "test": "node tools/test-restart.js && node tools/test-restart-e2e.js && node tools/test-release-config.js",
     "test:unit": "node tools/test-restart.js",
     "test:e2e": "node tools/test-restart-e2e.js",
-    "dist": "electron-builder --win",
-    "dist:installer": "electron-builder --win nsis",
-    "dist:portable": "electron-builder --win portable"
+    "test:release": "node tools/test-release-config.js",
+    "dist": "electron-builder --win zip",
+    "dist:dir": "electron-builder --win dir"
   },
   "devDependencies": {
     "electron": "^33.2.0",

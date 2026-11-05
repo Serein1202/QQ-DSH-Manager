@@ -35,49 +35,48 @@ jobs:
         run: |
           $repo = "${{ github.repository }}"
           $headers = @{ Authorization = "token ${{ secrets.GITHUB_TOKEN }}" }
-          $ver = ""
+          $pkg = Get-Content package.json -Raw | ConvertFrom-Json
+          $cand = $null
           try {
             $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/latest" -Headers $headers
             if ($rel.tag_name -match 'v?(\d+)\.(\d+)\.(\d+)') {
-              $maj = [int]$Matches[1]; $min = [int]$Matches[2]; $pat = [int]$Matches[3]
-              $ver = "$maj.$min.$($pat + 1)"
+              $cand = [version]"$($Matches[1]).$($Matches[2]).$([int]$Matches[3] + 1)"
             }
           } catch {
-            # 首次发布：无 latest release，忽略
+            # 首次发布：没有 latest release，忽略
           }
-          if (-not $ver) {
-            $pkg = Get-Content package.json -Raw | ConvertFrom-Json
-            $ver = $pkg.version
+          $local = $null
+          if ("$($pkg.version)" -match '^\d+\.\d+\.\d+$') { $local = [version]$pkg.version }
+          # 取两者较大值。只按「最新 tag 的 patch + 1」会把手动写高的版本号抹回去：
+          # 例如仓库已改成 1.1.0、最新 Release 是 1.0.10，自增结果 1.0.11 < 1.1.0，
+          # 发出去就是版本倒退，客户端 1.1.0 检查更新只会得到「已是最新」。
+          if ($cand -and $local) {
+            $ver = if ($local -gt $cand) { $local } else { $cand }
+          } elseif ($cand) {
+            $ver = $cand
+          } elseif ($local) {
+            $ver = $local
+          } else {
+            throw "无法确定版本号：package.json 的 version 不是三段式（$($pkg.version)）"
           }
-          "version=$ver" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "version=$($ver.ToString(3))" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
       - name: Sync version to package.json
         shell: pwsh
         run: npm version ${{ steps.version.outputs.version }} --no-git-tag-version
 
-      - name: Write electron-builder config
+      # 直接用仓库里的 electron-builder.yml（唯一真相源）。
+      # 旧版本这里内联生成 electron-builder.ci.yml，heredoc 里的 ${productName} 在 pwsh 双引号
+      # 字符串中会被当成变量展开成空串，产物名直接变成 "-win64.zip"，所以不再复制一份配置。
+      - name: Build zip
         shell: pwsh
-        run: |
-          @"
-          appId: com.qqdsh.manager
-          productName: QQ-DSH-Manager
-          directories:
-            output: release
-          files:
-            - src/**/*
-            - package.json
-          win:
-            target:
-              - target: portable
-                arch: [x64]
-              - target: zip
-                arch: [x64]
-          "@ | Set-Content -Path electron-builder.ci.yml -Encoding utf8
-
-      - name: Build exe & zip
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
-        run: npx electron-builder --win --config electron-builder.ci.yml
+        run: |
+          npx electron-builder --win zip --config electron-builder.yml --publish never
+          $zip = Get-ChildItem release -Filter *.zip -ErrorAction SilentlyContinue
+          if (-not $zip) { throw "打包失败：release/ 下没有产出 zip" }
+          $zip | ForEach-Object { "artifact: $($_.Name)  $([math]::Round($_.Length/1MB,1)) MB" }
 
       - name: Publish Release
         uses: softprops/action-gh-release@v2
@@ -87,10 +86,14 @@ jobs:
           body: |
             QQ-DSH-Manager v${{ steps.version.outputs.version }} 自动构建发布。
 
-            - exe：便携版，双击即用
-            - zip：完整解压即用目录
+            **下载 `QQ-DSH-Manager-*-win64.zip`，解压到任意目录，双击 `QQ-DSH-Manager.exe` 运行。**
+
+            本版本只提供 zip（解压即用目录），不再提供单文件 exe：
+            单文件 exe 每次运行都会自解压到临时目录，程序目录和你的解压目录对不上，
+            软件内"检查更新"自动替换会失败。zip 是就地运行，更新能原地覆盖。
+
+            升级方法：软件内点"检查更新"，或下载新 zip 解压后覆盖旧目录（保留 settings.json 即可）。
           files: |
-            release/*.exe
             release/*.zip
           draft: false
           prerelease: false

@@ -706,7 +706,8 @@ async function checkUpdate() {
       toast(`已是最新版本 v${r.current}`);
       return;
     }
-    const target = r.zip || r.installer;
+    // Release 只发 zip（解压即用的完整目录），没有 exe 资产可下载
+    const target = r.zip;
     if (!target) {
       // 后端在 API 限流时走网页跳转兜底，只有版本号没有资产直链 → 直接打开 Release 页面
       toast(`发现新版本 v${r.latest}，将打开 Release 页面，请手动下载`);

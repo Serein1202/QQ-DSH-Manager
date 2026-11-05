@@ -12,16 +12,17 @@ files:
 win:
   # 无管理员权限/开发者模式的机器上 winCodeSign 符号链接解压会失败，跳过 exe 元数据编辑
   signAndEditExecutable: false
+  # 只出 zip：解压即用的完整目录（含 resources/app.asar 与所有 dll）。
+  #
+  # 为什么砍掉 nsis 和 portable：
+  #   1. portable 单文件每次运行都自解压到 %TEMP% 下的随机目录，进程所在目录和用户解压目录不是同一个，
+  #      自动更新脚本 xcopy 覆盖"安装目录"时根本碰不到正在运行的那份，结果是新旧客户端并存、
+  #      用户下次双击旧 exe 又回到旧版本。
+  #   2. nsis 安装器把程序装进 Program Files，非管理员账户对安装目录没有写权限，
+  #      自替换更新会直接 Permission denied。
+  #   zip 是就地解压运行：程序目录 == 用户解压目录，替换脚本能原地覆盖，更新链路才闭环。
   target:
-    - target: nsis
+    - target: zip
       arch: [x64]
-    - target: portable
-      arch: [x64]
-nsis:
-  oneClick: false
-  perMachine: false
-  allowToChangeInstallationDirectory: true
-  createDesktopShortcut: true
-  shortcutName: QQ-DSH-Manager
-portable:
-  artifactName: QQ-DSH-Manager-便携版-${version}.exe
+  # 固定产物名，方便 update:install 识别资产，也方便用户看清架构
+  artifactName: ${productName}-${version}-win64.${ext}
