@@ -271,6 +271,36 @@ async function main() {
     fakeElectron.app.isPackaged = false; // 还原，避免影响其它用例
   }
 
+  console.log('\n== 用例 I：qq-bridge 默认下载地址迁移（旧 settings.json 生效） ==');
+  {
+    const store = require('../src/main/store.js');
+    const file = path.join(TMP, 'settings.json');
+    const LEGACY = 'https://github.com/Serein1202/qq-bridge/archive/refs/heads/main.zip';
+    const WANT = 'https://gh-proxy.org/https://github.com/Serein1202/qq-bridge/archive/refs/heads/main.zip';
+
+    // 1) 旧默认值 → 必须迁移到新地址（deepMerge 否则会让旧值永久生效）
+    fs.writeFileSync(file, JSON.stringify({ downloads: { qqbridge: LEGACY } }, null, 2), 'utf8');
+    store.resetCache();
+    const s1 = store.settings();
+    ok('旧默认值被迁移到 gh-proxy', s1.downloads.qqbridge === WANT, s1.downloads.qqbridge);
+
+    // 2) 用户自定义值 → 绝对不能动
+    const CUSTOM = 'https://ghfast.top/https://github.com/Serein1202/qq-bridge/archive/refs/heads/main.zip';
+    fs.writeFileSync(file, JSON.stringify({ downloads: { qqbridge: CUSTOM } }, null, 2), 'utf8');
+    store.resetCache();
+    const s2 = store.settings();
+    ok('用户自定义地址不被覆盖', s2.downloads.qqbridge === CUSTOM, s2.downloads.qqbridge);
+
+    // 3) 没有 downloads 段的老配置 → 取新默认值
+    fs.writeFileSync(file, JSON.stringify({ scanRoot: '' }, null, 2), 'utf8');
+    store.resetCache();
+    const s3 = store.settings();
+    ok('缺省时取新默认值', s3.downloads.qqbridge === WANT, s3.downloads.qqbridge);
+
+    fs.rmSync(file, { force: true });
+    store.resetCache();
+  }
+
   console.log(`\n结果: ${pass} 通过 / ${fail} 失败`);
   try {
     fs.rmSync(TMP, { recursive: true, force: true });

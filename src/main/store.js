@@ -6,10 +6,16 @@ const path = require('path');
 
 // 各下载源默认值。snowluma / dsh 默认官网地址（网页跳转），用户可在"高级设置"里覆盖；
 // 填了 zip 直链就自动下载解压，只填网页地址就跳浏览器。
+// qq-bridge 仓库是源码包（archive/refs/heads/main.zip），GitHub 直连在国内基本拿不到，
+// 所以默认地址直接套 gh-proxy.org 前缀；用户可以在高级设置里换成自己的镜像或直连。
+const QQBRIDGE_DEFAULT = 'https://gh-proxy.org/https://github.com/Serein1202/qq-bridge/archive/refs/heads/main.zip';
+// 旧版默认地址：只用来识别「用户没改过」，命中就迁移到新地址（用户自己填过的绝不动）
+const QQBRIDGE_LEGACY = 'https://github.com/Serein1202/qq-bridge/archive/refs/heads/main.zip';
+
 const DEFAULT_DOWNLOADS = {
   snowluma: 'https://github.com/SnowLuma/SnowLuma/releases',
   dsh: 'https://www.deepseek.com/harness/',
-  qqbridge: 'https://github.com/Serein1202/qq-bridge/archive/refs/heads/main.zip',
+  qqbridge: QQBRIDGE_DEFAULT,
   node: 'https://npmmirror.com/mirrors/node/v22.14.0/node-v22.14.0-win-x64.zip',
 };
 
@@ -50,12 +56,23 @@ function deepMerge(base, extra) {
 }
 
 function loadSettings() {
+  let out;
   try {
     const raw = fs.readFileSync(settingsFile(), 'utf8');
-    return deepMerge(DEFAULT_SETTINGS, JSON.parse(raw));
+    out = deepMerge(DEFAULT_SETTINGS, JSON.parse(raw));
   } catch {
-    return JSON.parse(JSON.stringify(DEFAULT_SETTINGS));
+    out = JSON.parse(JSON.stringify(DEFAULT_SETTINGS));
   }
+  // 迁移 qq-bridge 默认下载地址。deepMerge 会让老 settings.json 里的旧值一直生效，
+  // 只改 DEFAULT_DOWNLOADS 对已装过的机器等于没改。
+  // 仅当值恰好等于旧默认值时才替换 —— 那是「用户从没改过」的唯一可靠标志，
+  // 用户自己填的镜像/直连原样保留。
+  try {
+    if (out && out.downloads && out.downloads.qqbridge === QQBRIDGE_LEGACY) {
+      out.downloads.qqbridge = QQBRIDGE_DEFAULT;
+    }
+  } catch { /* 结构异常就算了，不影响主流程 */ }
+  return out;
 }
 
 function saveSettings(settings) {

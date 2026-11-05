@@ -61,9 +61,13 @@ jobs:
           }
           "version=$($ver.ToString(3))" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
+      # 用 tools/set-version.js 而不是 `npm version <ver> --no-git-tag-version`：
+      # 目标版本与 package.json 现有版本相同时，npm 10 会直接 `npm error Version not changed` 退出，
+      # 整条流水线在「同步版本号」这一步挂掉（run #10 就是这么失败的，Release 停在 1.0.11）。
+      # 而这个「相同」是常态：版本号取 max(最新 tag + 1, package.json)，
+      # 手动把仓库改成 1.1.0、最新 Release 还是 1.0.10 时，取大结果正好等于 1.1.0。
       - name: Sync version to package.json
-        shell: pwsh
-        run: npm version ${{ steps.version.outputs.version }} --no-git-tag-version
+        run: node tools/set-version.js ${{ steps.version.outputs.version }}
 
       # 直接用仓库里的 electron-builder.yml（唯一真相源）。
       # 旧版本这里内联生成 electron-builder.ci.yml，heredoc 里的 ${productName} 在 pwsh 双引号

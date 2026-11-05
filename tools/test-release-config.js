@@ -55,6 +55,11 @@ console.log('\n== .github/workflows/release.yml ==');
   ok('用仓库内 electron-builder.yml', /--config\s+electron-builder\.yml/.test(body));
   // 旧实现用 pwsh here-string 内联生成配置，${productName} 会被 PowerShell 当变量展开成空串
   ok('不内联生成 electron-builder.ci.yml', !/electron-builder\.ci\.yml\s*$/m.test(body.replace(/--config\s+electron-builder\.yml/g, '')));
+  // 版本号同步：npm version 在「目标版本 == 现有版本」时会 `npm error Version not changed` 直接失败，
+  // 而 CI 的版本号恰恰经常等于 package.json（max(tag+1, pkg)）。run #10 就死在这一步。
+  ok('版本同步用 tools/set-version.js', /node\s+tools\/set-version\.js/.test(body));
+  ok('不再用 npm version 改版本', !/\bnpm\s+version\b/.test(body));
+  ok('set-version.js 存在', fs.existsSync(path.join(ROOT, 'tools/set-version.js')));
 }
 
 console.log('\n== package.json scripts ==');
