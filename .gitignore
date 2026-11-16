@@ -28,3 +28,6 @@ desktop.ini
 *.tmp
 .idea/
 .vscode/
+
+# ---- 本助手工作区数据（本地记忆等）----
+.workbuddy/

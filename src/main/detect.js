@@ -1,4 +1,4 @@
-// detect.js — 环境检测：Node / SnowLuma / DSH / qq-bridge
+// detect.js — 环境检测：Node / SnowLuma / DSH
 'use strict';
 const fs = require('fs');
 const path = require('path');
@@ -153,32 +153,18 @@ function detectAllImpl() {
   const s = settings();
   const roots = scanRoots();
 
-  // ---- qq-bridge（先找它：它的 config.json 里有 SnowLuma homeDir 线索）----
-  const qbDir =
-    componentDir('qqbridge', ['qq-bridge', 'qqbridge'], (d) => isDir(path.join(d, 'node_modules'))) ||
-    componentDir('qqbridge', ['qq-bridge', 'qqbridge']);
-  const qbEntry = qbDir ? path.join(qbDir, 'src', 'bridge.js') : '';
-  const qbNodeMods = qbDir ? path.join(qbDir, 'node_modules') : '';
-  const qbCfg = qbDir ? path.join(qbDir, 'config.json') : '';
-  let qbHomeDirHint = '';
-  if (qbCfg && exists(qbCfg)) {
-    try {
-      qbHomeDirHint = JSON.parse(fs.readFileSync(qbCfg, 'utf8'))?.snowluma?.homeDir || '';
-    } catch {}
-  }
-
   // ---- SnowLuma ----
   const snowDir =
     componentDir('snowluma', ['snowluma'], (d) => exists(path.join(d, 'index.mjs')), SNOW_EXCLUDE) ||
-    componentDir('snowluma', ['snowluma'], null, SNOW_EXCLUDE) ||
-    (isDir(qbHomeDirHint) ? qbHomeDirHint : '');
+    componentDir('snowluma', ['snowluma'], null, SNOW_EXCLUDE);
   const snowEntry = snowDir ? path.join(snowDir, 'index.mjs') : '';
   const snowNodeExe = snowDir ? path.join(snowDir, 'node.exe') : '';
   const snowNode = exists(snowNodeExe) ? snowNodeExe : findNode(snowDir ? '' : '').path;
   const snowNodeVer = snowNode ? nodeVersion(snowNode) : '';
 
   // ---- DSH ----
-  // 目录名含关键词不算安装：残留目录（卸载未删净）也会命中，必须校验 exe / app.asar 存在
+  // 目录名含关键词不算安装：残留目录（卸载未删净）也会命中，必须校验 exe / app.asar 存在。
+  // qq-bridge 已移除，但磁盘上可能残留旧目录（内含 dsh/deepseek 字样的子目录），继续排除防误报
   const dshConf = s.components.dsh || {};
   const dshCands = discoverMatches(['dsh', 'deepseek', 'harness'], /qq-bridge/i).filter(
     (d) => findDshExe(d) || exists(path.join(d, 'resources', 'app.asar'))
@@ -235,23 +221,6 @@ function detectAllImpl() {
             ? `dsh web · ${dshLaunch.workspace}` + (dshLaunch.cliReal ? '' : '（CLI 在 app.asar 内，插件市场更新会失败）')
             : '已安装，但未找到 dsh CLI（app.asar 缺失，建议重装 DSH）',
     },
-    qqbridge: {
-      state:
-        qbDir && exists(qbEntry) && isDir(qbNodeMods) && exists(qbCfg)
-          ? 'ok'
-          : qbDir && exists(qbEntry)
-            ? 'warn'
-            : 'missing',
-      dir: qbDir,
-      entry: qbEntry,
-      detail: !qbDir
-        ? '未找到目录'
-        : !exists(qbCfg)
-          ? '缺 config.json（可在配置页自动生成）'
-          : !isDir(qbNodeMods)
-            ? '缺 node_modules，点"修复"自动 npm install'
-            : '依赖完整',
-    },
   };
 }
 
@@ -276,7 +245,7 @@ function findDshExe(dshDir) {
 
 // 解析 DSH 的启动三件套：exe、dsh CLI 入口、workspace 根目录。
 // 为什么不能直接双击 exe：桌面 exe 起的是 `desktop` profile（只有 GUI，不监听端口）；
-// qq-bridge 需要的 3080 属于 `web` profile（web-server 插件），必须用 CLI 跑 `dsh web`。
+// web profile（web-server 插件）的 3080 端口必须用 CLI 跑 `dsh web`。
 // CLI 入口在 app.asar 内，普通 node 读不了 asar，所以用 Electron 本体 + ELECTRON_RUN_AS_NODE=1 执行。
 //
 // 为什么优先用磁盘上的真实 CLI 副本：dshmarket（DSH 插件市场）更新插件时会 spawn 子进程，

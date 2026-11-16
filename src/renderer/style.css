@@ -88,7 +88,7 @@ button.btn:disabled { opacity: 0.5; cursor: not-allowed; }
 /* 表单 */
 .field { margin-bottom: 12px; }
 .field label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
-.field input, .field textarea {
+.field input, .field textarea, .field select {
   width: 100%;
   max-width: 560px;
   padding: 8px 10px;
@@ -96,8 +96,9 @@ button.btn:disabled { opacity: 0.5; cursor: not-allowed; }
   border-radius: 8px;
   font-size: 13px;
   font-family: inherit;
+  background: #fff;
 }
-.field input:focus { outline: none; border-color: var(--accent); }
+.field input:focus, .field select:focus { outline: none; border-color: var(--accent); }
 .secret-row { display: flex; gap: 6px; max-width: 560px; }
 .secret-row input { flex: 1; }
 

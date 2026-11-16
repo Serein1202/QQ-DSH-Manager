@@ -2,7 +2,7 @@
 // 运行：node tools/test-restart-e2e.js
 //
 // 做法：用 Module._load 拦截 require('electron')，注入最小 stub；再替换 services.buildServiceList
-// 为确定性桩（避免依赖本机是否装了 DSH / qq-bridge），然后直接调用 ipc.js 里注册的 handler。
+// 为确定性桩（避免依赖本机是否装了 DSH），然后直接调用 ipc.js 里注册的 handler。
 // 覆盖：
 //   A. 服务未运行时点「重启」——旧代码必然报「停止失败：服务未在运行」，现在必须能正常启动
 //   B. 服务运行中点「重启」——必须换新 PID 且托管状态保持
@@ -269,36 +269,6 @@ async function main() {
     ok('三段式版本号', /^\d+\.\d+\.\d+$/.test(String(pv && pv.version)), `got=${pv && pv.version}`);
 
     fakeElectron.app.isPackaged = false; // 还原，避免影响其它用例
-  }
-
-  console.log('\n== 用例 I：qq-bridge 默认下载地址迁移（旧 settings.json 生效） ==');
-  {
-    const store = require('../src/main/store.js');
-    const file = path.join(TMP, 'settings.json');
-    const LEGACY = 'https://github.com/Serein1202/qq-bridge/archive/refs/heads/main.zip';
-    const WANT = 'https://gh-proxy.org/https://github.com/Serein1202/qq-bridge/archive/refs/heads/main.zip';
-
-    // 1) 旧默认值 → 必须迁移到新地址（deepMerge 否则会让旧值永久生效）
-    fs.writeFileSync(file, JSON.stringify({ downloads: { qqbridge: LEGACY } }, null, 2), 'utf8');
-    store.resetCache();
-    const s1 = store.settings();
-    ok('旧默认值被迁移到 gh-proxy', s1.downloads.qqbridge === WANT, s1.downloads.qqbridge);
-
-    // 2) 用户自定义值 → 绝对不能动
-    const CUSTOM = 'https://ghfast.top/https://github.com/Serein1202/qq-bridge/archive/refs/heads/main.zip';
-    fs.writeFileSync(file, JSON.stringify({ downloads: { qqbridge: CUSTOM } }, null, 2), 'utf8');
-    store.resetCache();
-    const s2 = store.settings();
-    ok('用户自定义地址不被覆盖', s2.downloads.qqbridge === CUSTOM, s2.downloads.qqbridge);
-
-    // 3) 没有 downloads 段的老配置 → 取新默认值
-    fs.writeFileSync(file, JSON.stringify({ scanRoot: '' }, null, 2), 'utf8');
-    store.resetCache();
-    const s3 = store.settings();
-    ok('缺省时取新默认值', s3.downloads.qqbridge === WANT, s3.downloads.qqbridge);
-
-    fs.rmSync(file, { force: true });
-    store.resetCache();
   }
 
   console.log(`\n结果: ${pass} 通过 / ${fail} 失败`);

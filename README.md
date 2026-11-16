@@ -1,15 +1,14 @@
 # QQ-DSH-Manager
 
-给小白用的拟人化 AI 桌面部署管理器。管四样东西：**SnowLuma**（QQ 协议端）、**DSH**（DeepSeek Harness）、**qq-bridge**（桥接）、**ai-companion-kit**（记忆/手机MCP/空间）。
+给小白用的拟人化 AI 桌面部署管理器。管两样东西：**SnowLuma**（QQ 协议端）、**DSH**（DeepSeek Harness）。
 
 ## 功能
 
 | 页面 | 功能 |
 |---|---|
-| 环境检测 | 自动扫描组件目录（Node / SnowLuma / DSH / qq-bridge / companion-kit），红绿灯显示，缺什么点什么：一键下载解压 + npm install |
-| 服务管理 | 每个服务启动/停止/重启 + Web 入口按钮（端口就绪才可点，直达 SnowLuma WebUI / DSH / bridge 控制台），实时日志，崩溃自动重启（可选），一键按依赖顺序全部启动（SnowLuma → DSH → bridge），SnowLuma 扫码登录引导 |
-| 凭证配置 | 表单化编辑 qq-bridge 的 config.json（主人QQ、允许群号、DSH/SnowLuma 凭证等）和 SnowLuma 的 runtime.json / onebot_*.json，保存前自动备份 .bak |
-| 高级设置 | 组件目录手动指定、DSH 启动命令、各下载源地址、管理器更新清单、关闭软件时是否停服务 |
+| 环境检测 | 自动扫描组件目录（Node / SnowLuma / DSH），红绿灯显示，缺什么点什么：一键下载解压 |
+| 服务管理 | 每个服务启动/停止/重启 + Web 入口按钮（端口就绪才可点，直达 SnowLuma WebUI / DSH），实时日志，崩溃自动重启（可选），一键按依赖顺序全部启动（SnowLuma → DSH），SnowLuma 扫码登录引导 |
+| 高级设置 | 组件目录手动指定、DSH 启动命令、各下载源地址、管理器更新清单、关闭按钮行为（询问/最小化/退出，可记住选择）、关闭软件时是否停服务 |
 
 ## 运行
 
@@ -44,12 +43,10 @@ GitHub Actions（`.github/workflows/release.yml`）在 push 到 main 时自动�
 ## 首次部署流程（小白视角）
 
 1. 双击打开软件 → 首页自动检测
-2. 缺 qq-bridge / companion-kit → 点"一键下载安装"（走 gh-proxy 加速，自动 npm install）
-3. 缺 SnowLuma / DSH → 官网下载解压后，在"高级设置"里指定目录（或直接在高级设置里填 zip 直链，之后就能一键装）
-4. SnowLuma 首次登录：点首页"打开扫码窗口"扫码
-5. "凭证配置"页填 QQ 号 / 群号 / authToken → 保存
-6. "服务管理"页点"🚀 一键全部启动"
-7. "Web 入口"页点链接进各 WebUI
+2. 缺 SnowLuma / DSH → 官网下载解压后，在"高级设置"里指定目录（或直接在高级设置里填 zip 直链，之后就能一键装）
+3. SnowLuma 首次登录：点首页"打开扫码窗口"扫码
+4. "服务管理"页点"🚀 一键全部启动"
+5. "Web 入口"页点链接进各 WebUI
 
 ## DSH 插件市场更新失败（spawn … ENOENT）
 
@@ -96,6 +93,6 @@ QQ-DSH-Manager/
 
 - **扫描根目录**：打包版默认 exe 所在目录；开发版默认本目录上两级。高级设置可改。
 - **DSH**：官方成品，启动命令不通用，需在高级设置里填（如 `start.bat`），端口默认 3080。
-- **SnowLuma / DSH 下载地址**：官网直链未预置（避免写死失效地址），高级设置里填 zip 直链即可启用一键下载；qq-bridge / companion-kit 已预置 gh-proxy 加速的 GitHub 地址。
-- **Node 版本要求**：qq-bridge ≥22.13；SnowLuma 优先用其目录自带的 node.exe。
+- **SnowLuma / DSH 下载地址**：官网直链未预置（避免写死失效地址），高级设置里填 zip 直链即可启用一键下载。
+- **Node 版本要求**：SnowLuma 优先用其目录自带的 node.exe。
 

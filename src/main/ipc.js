@@ -1,4 +1,4 @@
-// ipc.js — 主进程 IPC 路由：检测 / 服务 / 配置 / 下载 / 设置 / Shell
+// ipc.js — 主进程 IPC 路由：检测 / 服务 / 下载 / 设置 / Shell
 'use strict';
 const { ipcMain, dialog, shell, BrowserWindow, app } = require('electron');
 const { spawnSync, spawn } = require('child_process');
@@ -9,7 +9,7 @@ const { settings, updateSettings, defaultScanRoot, scanRoots } = require('./stor
 const { detectAll, invalidateDetect, findNode } = require('./detect');
 const { ProcessManager, probePort } = require('./procs');
 const { buildServiceList, START_ORDER } = require('./services');
-const { downloadFile, unzip, npmInstall, fetchJson, GITHUB_MIRRORS, githubMirrorUrl } = require('./downloader');
+const { downloadFile, unzip, fetchJson, GITHUB_MIRRORS, githubMirrorUrl } = require('./downloader');
 
 const pm = new ProcessManager();
 const downloads = new Map(); // key -> { running: true } 防重复下载
@@ -126,57 +126,20 @@ pm.onExit = (id) => {
   send('proc:exit', { id });
 };
 
-// ---------- 配置读写（带备份 + 深路径 set） ----------
-function deepSet(obj, dottedPath, value) {
-  const keys = dottedPath.split('.');
-  let cur = obj;
-  for (let i = 0; i < keys.length - 1; i++) {
-    if (typeof cur[keys[i]] !== 'object' || cur[keys[i]] === null) cur[keys[i]] = {};
-    cur = cur[keys[i]];
-  }
-  cur[keys[keys.length - 1]] = value;
-}
-function deepGet(obj, dottedPath, def) {
-  let cur = obj;
-  for (const k of dottedPath.split('.')) {
-    if (cur === null || cur === undefined) return def;
-    cur = cur[k];
-  }
-  return cur === undefined ? def : cur;
-}
-function backupAndWrite(file, data) {
-  if (fs.existsSync(file)) {
-    fs.copyFileSync(file, file + '.bak');
-  }
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  const tmp = file + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(data, null, 2), 'utf8');
-  fs.renameSync(tmp, file);
-}
-
-// SnowLuma 的 onebot_*.json 按登录 QQ 号分文件，全部列出给前端编辑
-function listOnebotFiles(snowDir) {
-  const dir = path.join(snowDir, 'config');
-  if (!fs.existsSync(dir)) return [];
-  return fs
-    .readdirSync(dir)
-    .filter((f) => /^onebot_\d+\.json$/.test(f))
-    .map((f) => path.join(dir, f));
-}
-
 // ---------- 主进程侧入参校验（防渲染层被 XSS 后滥用敏感 handler） ----------
-const ALLOW_INSTALL_KEYS = new Set(['node', 'snowluma', 'dsh', 'qqbridge']);
-const ALLOW_DOWNLOAD_KEYS = new Set(['snowluma', 'dsh', 'qqbridge', 'node']);
-const ALLOW_RESTART_KEYS = new Set(['snowluma', 'dsh', 'qqbridge']);
+const ALLOW_INSTALL_KEYS = new Set(['node', 'snowluma', 'dsh']);
+const ALLOW_DOWNLOAD_KEYS = new Set(['snowluma', 'dsh', 'node']);
+const ALLOW_RESTART_KEYS = new Set(['snowluma', 'dsh']);
 
 // settings:set 白名单 schema：未知字段丢弃、类型不符丢弃（number 允许字符串数字）
 const SETTINGS_SCHEMA = {
   scanRoot: 'string',
   closeStopServices: 'boolean',
+  // 点关闭按钮的行为：ask / minimize / exit（主进程 index.js 消费）
+  closeAction: 'string',
   components: {
     snowluma: { dir: 'string' },
     dsh: { dir: 'string', startCommand: 'string', port: 'number', workspace: 'string' },
-    qqbridge: { dir: 'string' },
   },
   downloads: { keySet: ALLOW_DOWNLOAD_KEYS, type: 'stringMap' },
   autoRestart: { keySet: ALLOW_RESTART_KEYS, type: 'booleanMap' },
@@ -229,23 +192,6 @@ function isUnderScanRoots(p) {
   });
 }
 
-// config:write 只允许写这几个文件：qq-bridge config.json、SnowLuma runtime.json、onebot_*.json
-function isAllowedConfigFile(file) {
-  if (!file || typeof file !== 'string') return false;
-  const resolved = path.resolve(file).toLowerCase();
-  const d = detectAll();
-  if (d.qqbridge.dir && path.resolve(path.join(d.qqbridge.dir, 'config.json')).toLowerCase() === resolved) return true;
-  if (d.snowluma.dir) {
-    const cfgDir = path.resolve(path.join(d.snowluma.dir, 'config'));
-    if (path.resolve(path.join(cfgDir, 'runtime.json')).toLowerCase() === resolved) return true;
-    const name = path.basename(resolved);
-    if (path.dirname(path.resolve(resolved)) === path.resolve(cfgDir).toLowerCase() && /^onebot_\d+\.json$/.test(name)) {
-      return true;
-    }
-  }
-  return false;
-}
-
 // ---------- 安装流程 ----------
 async function installComponent(key, targetDir, onStep) {
   const s = settings();
@@ -281,23 +227,6 @@ async function installComponent(key, targetDir, onStep) {
   unzip(tmpZip, targetDir);
   fs.unlinkSync(tmpZip);
 
-  if (key === 'qqbridge') {
-    // 仓库不含 config.json（只有 example），解压后先兜底生成，避免 npm 失败导致永远缺失
-    const example = path.join(targetDir, 'config.example.json');
-    const target = path.join(targetDir, 'config.json');
-    if (fs.existsSync(example) && !fs.existsSync(target)) {
-      fs.copyFileSync(example, target);
-      step('已生成 config.json（去"配置"页填写凭证）');
-    }
-    step('安装依赖（npm install，可能要几分钟）…');
-    const nodeDir = path.join(defaultScanRoot(), 'tools', '_runtime', 'node');
-    const nodeExe = path.join(nodeDir, 'node.exe');
-    const res = await npmInstall(targetDir, fs.existsSync(nodeExe) ? nodeDir : '');
-    if (!res.ok) {
-      throw new Error(res.error + (res.log && res.log.length ? '\n最近日志：\n' + res.log.slice(-15).join('\n') : ''));
-    }
-    step('依赖安装完成');
-  }
   step('安装完成');
 }
 
@@ -354,7 +283,6 @@ function registerIpc() {
           ports,
           startable: svc.startable,
           blockedReason: svc.blockedReason,
-          companionHint: svc.companionHint || '',
           webLinks: svc.webLinks.map((l) => ({ ...l, open: !!ports[l.port] })),
         };
       })
@@ -392,21 +320,13 @@ function registerIpc() {
       }
     }
     const r = pm.start(id, svc.run);
-    // 附属服务（qq-bridge 的手机 MCP / QQ 空间）随主服务一起拉起，日志并入主面板
-    const companions = [];
-    for (const c of svc.companions || []) {
-      const cr = pm.start(c.id, { ...c.run, logTo: id, logPrefix: c.name });
-      companions.push({ id: c.id, name: c.name, ok: cr.ok, error: cr.error });
-    }
     if (r.ok) pm.clearCrash(id); // 手动启动成功：清掉崩溃计数，重置自动重启退避
     const warn = r.ok ? await waitReady(svc.probePorts) : '';
-    return { ...r, companions, ...(warn ? { warn } : {}) };
+    return { ...r, ...(warn ? { warn } : {}) };
   });
 
   ipcMain.handle('svc:stop', async (_e, id) => {
     const svc = buildServiceList().find((x) => x.id === id);
-    // 先停附属服务，再停主服务（顺序反了容易留孤儿进程）
-    for (const c of (svc && svc.companions) || []) await pm.stopAsync(c.id);
     // 必须传 verify：非托管实例（管理器没托管，靠端口/命令行反查）要靠身份特征确认归属。
     // 不传时 verify 为空 → 端口命中的进程一律被判「无法确认是本服务」→ 停止按钮永远失败。
     const r = await pm.stopAsync(id, svc ? svc.probePorts : [], svc ? svc.run.cwd : '', {
@@ -423,8 +343,6 @@ function registerIpc() {
     if (!svc) return { ok: false, error: '未知服务' };
     // 先判可启动性，再做停止：反过来的话，服务不可启动时会被停掉却起不来
     if (!svc.startable) return { ok: false, error: svc.blockedReason || '无法启动' };
-
-    for (const c of svc.companions || []) await pm.stopAsync(c.id);
 
     // 服务本来就没在运行时（崩溃过 / 首次启动），stop 会返回 notRunning。
     // 这不是错误，直接进启动分支。以前无条件当失败中止，导致「没运行 → 点重启 → 报停止失败」
@@ -460,14 +378,9 @@ function registerIpc() {
     pm.clearCrash(id); // 手动重启：清崩溃计数，重开自动重启退避窗口
     const r = pm.start(id, svc.run);
     if (!r.ok) return r;
-    const companions = [];
-    for (const c of svc.companions || []) {
-      const cr = pm.start(c.id, { ...c.run, logTo: id, logPrefix: c.name });
-      companions.push({ id: c.id, name: c.name, ok: cr.ok, error: cr.error });
-    }
     // 等端口就绪再返回：否则前端刷新看到「未运行」，会把成功重启误判成失败
     const warn = await waitReady(ports, 20000);
-    return { ...r, companions, ...(warn ? { warn } : {}) };
+    return { ...r, ...(warn ? { warn } : {}) };
   });
 
   // 一键全部启动：按依赖顺序，每个等端口就绪再起下一个
@@ -488,10 +401,8 @@ function registerIpc() {
         }
       }
       const r = pm.start(id, svc.run);
-      // 附属服务跟随主服务启动
-      for (const c of svc.companions || []) pm.start(c.id, { ...c.run, logTo: id, logPrefix: c.name });
       results.push({ id, ok: r.ok, error: r.error });
-      // SnowLuma 等 3000 口就绪；DSH 等它自己的口；bridge 等 3100
+      // SnowLuma 等 3000 口就绪；DSH 等它自己的口
       if (r.ok && svc.probePorts.length) {
         const deadline = Date.now() + 45000;
         let up = false;
@@ -516,63 +427,13 @@ function registerIpc() {
 
   ipcMain.handle('svc:stopAll', () => stopAllServices());
 
-  // 配置读写
-  ipcMain.handle('config:read', (_e, component) => {
-    const d = detectAll();
-    if (component === 'qqbridge' && d.qqbridge.dir) {
-      const file = path.join(d.qqbridge.dir, 'config.json');
-      let data = {};
-      try {
-        data = JSON.parse(fs.readFileSync(file, 'utf8'));
-      } catch (e) {
-        return { file, error: '读取失败: ' + e.message };
-      }
-      return { file, data };
-    }
-    if (component === 'snowluma' && d.snowluma.dir) {
-      const rtFile = path.join(d.snowluma.dir, 'config', 'runtime.json');
-      let runtime = {};
-      try {
-        runtime = JSON.parse(fs.readFileSync(rtFile, 'utf8'));
-      } catch {}
-      const onebots = listOnebotFiles(d.snowluma.dir).map((f) => {
-        try {
-          return { file: f, name: path.basename(f), data: JSON.parse(fs.readFileSync(f, 'utf8')) };
-        } catch (e) {
-          return { file: f, name: path.basename(f), data: {}, error: e.message };
-        }
-      });
-      return { runtimeFile: rtFile, runtime, onebots };
-    }
-    return { error: '未检测到该组件目录' };
-  });
-
-  ipcMain.handle('config:write', (_e, { file, apply }) => {
-    // apply: [{ path, value }]，一次性合并写回，减少多次备份
-    // 主进程侧校验：只允许写检测到的组件配置文件（qq-bridge config.json / SnowLuma runtime.json / onebot_*.json）
-    if (!isAllowedConfigFile(file)) return { ok: false, error: '目标文件不在允许写入的配置范围内' };
-    if (!Array.isArray(apply) || !apply.length) return { ok: false, error: '无效的写入请求' };
-    for (const item of apply) {
-      if (!item || typeof item.path !== 'string') return { ok: false, error: '无效的写入路径' };
-    }
-    let data = {};
-    try {
-      data = JSON.parse(fs.readFileSync(file, 'utf8'));
-    } catch {
-      data = {};
-    }
-    for (const { path: p, value } of apply) deepSet(data, p, value);
-    backupAndWrite(file, data);
-    return { ok: true };
-  });
-
   // 下载 / 安装
   ipcMain.handle('dl:install', async (_e, { key, targetDir }) => {
     if (!ALLOW_INSTALL_KEYS.has(key)) return { ok: false, error: '未知的安装组件' };
     if (downloads.get(key)) return { ok: false, error: '该组件正在安装中' };
     downloads.set(key, true);
     try {
-      const dir = targetDir || path.join(defaultScanRoot(), key === 'qqbridge' ? 'qq-bridge' : key);
+      const dir = targetDir || path.join(defaultScanRoot(), key);
       // 主进程侧校验：安装目标目录必须位于扫描根内，防止任意路径写入
       if (!isUnderScanRoots(dir)) {
         downloads.delete(key);
@@ -597,36 +458,16 @@ function registerIpc() {
     return { ok: true };
   });
 
-  // 修复：npm install
-  ipcMain.handle('fix:npmInstall', async (_e, { dir }) => {
-    if (!dir) return { ok: false, error: '目录不存在' };
-    const nodeDir = path.join(defaultScanRoot(), 'tools', '_runtime', 'node');
-    const nodeExe = path.join(nodeDir, 'node.exe');
-    send('dl:step', { key: 'fix', msg: `npm install @ ${dir}` });
-    const res = await npmInstall(dir, fs.existsSync(nodeExe) ? nodeDir : '');
-    if (res.ok) {
-      // 修复成功后兜底补齐 config.json（仓库不含，只有 example）
-      const example = path.join(dir, 'config.example.json');
-      const target = path.join(dir, 'config.json');
-      if (fs.existsSync(example) && !fs.existsSync(target)) {
-        try {
-          fs.copyFileSync(example, target);
-        } catch (e) {}
-      }
-      invalidateDetect();
-    } else {
-      res.error = res.error + (res.log && res.log.length ? '\n最近日志：\n' + res.log.slice(-15).join('\n') : '');
-    }
-    send('dl:done', { key: 'fix', ok: res.ok, error: res.error });
-    return res;
-  });
-
   // 设置
   ipcMain.handle('settings:get', () => settings());
   ipcMain.handle('settings:set', (_e, patch) => {
     // 主进程侧白名单 schema 校验：未知字段/非法类型直接丢弃，防止注入恶意 startCommand / 下载地址
     const clean = sanitizeBySchema(patch || {}, SETTINGS_SCHEMA);
     if (!clean || typeof clean !== 'object') return { ok: false, error: '无效的设置内容' };
+    // closeAction 只认三个枚举值，非法值丢弃（退回默认 ask）
+    if (clean.closeAction !== undefined && !['ask', 'minimize', 'exit'].includes(clean.closeAction)) {
+      delete clean.closeAction;
+    }
     const r = updateSettings(clean);
     invalidateDetect(); // 目录变了立刻重扫
     return r;
@@ -956,10 +797,6 @@ function registerIpc() {
     setTimeout(() => {
       const r = pm.start(id, svc.run);
       if (!r.ok) send('proc:log', { id, line: `[${new Date().toLocaleTimeString()}] 自动重启失败: ${r.error}` });
-      // 附属服务（qq-bridge 的手机 MCP / QQ 空间）随主服务一起恢复
-      for (const c of svc.companions || []) {
-        pm.start(c.id, { ...c.run, logTo: id, logPrefix: c.name });
-      }
     }, delay);
   };
 }

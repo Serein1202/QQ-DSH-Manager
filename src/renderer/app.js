@@ -1,10 +1,9 @@
-// app.js — 渲染层：五个视图（检测 / 服务 / 配置 / 链接 / 设置）
+// app.js — 渲染层：四个视图（检测 / 服务 / 设置 / 更新）
 'use strict';
 const $content = document.getElementById('content');
 const $foot = document.getElementById('sidebar-foot');
 let currentView = 'home';
 let pollTimer = null;
-let selectedTab = 'qqbridge';
 
 /* ---------- 小工具 ---------- */
 function el(tag, attrs = {}, ...children) {
@@ -110,17 +109,6 @@ async function renderHome() {
     d.dsh.dir ? actBtn('打开目录', false, () => window.api.invoke('shell:openPath', d.dsh.dir)) : null,
   ]);
 
-  // qq-bridge
-  const qbActions = [];
-  if (d.qqbridge.state === 'missing') qbActions.push(actBtn('一键下载安装', true, () => runInstall('qqbridge', null)));
-  if (d.qqbridge.state === 'warn' && d.qqbridge.detail.includes('node_modules'))
-    qbActions.push(actBtn('修复（npm install）', true, () => fixNpm(d.qqbridge.dir)));
-  const qbCard = card('qq-bridge（桥接）', d.qqbridge, [
-    ...qbActions,
-    specDirBtn('qqbridge'),
-    d.qqbridge.dir ? actBtn('打开目录', false, () => window.api.invoke('shell:openPath', d.qqbridge.dir)) : null,
-  ]);
-
   function runInstall(key, targetDir) {
     installBox.textContent += `\n[开始] ${key}\n`;
     window.api.invoke('dl:install', { key, targetDir }).then((r) => {
@@ -129,10 +117,6 @@ async function renderHome() {
         installBox.scrollTop = installBox.scrollHeight;
       }
     });
-  }
-  function fixNpm(dir) {
-    installBox.textContent += `\n[修复] npm install @ ${dir}\n`;
-    window.api.invoke('fix:npmInstall', { dir });
   }
 
   onChan('dl:step', ({ key, msg }) => {
@@ -162,7 +146,6 @@ async function renderHome() {
     nodeCard,
     snowCard,
     dshCard,
-    qbCard,
     el('div', { class: 'card' }, el('h3', {}, '安装日志'), installBox),
     el('p', { class: 'sub' }, `自动扫描目录：${(d.scanRoots || [d.scanRoot]).join('　')}（可在高级设置里更改）`)
   );
@@ -341,8 +324,7 @@ async function renderServices() {
     const mode = svc.managed ? '· 由管理器托管' : svc.running ? '· 外部进程' : '';
     const up = svc.uptimeMs ? `· 已运行 ${fmtUptime(svc.uptimeMs)}` : '';
     const state = op ? `· ${SVC_ACTION_TEXT[op] || '处理中'}` : svc.running ? '· 运行中' : '· 已停止';
-    const cpHint = svc.companionHint ? ' · ' + svc.companionHint : '';
-    row._meta.textContent = `${svc.desc} ${portInfo} ${state} ${mode} ${up}${cpHint}`.replace(/\s+/g, ' ');
+    row._meta.textContent = `${svc.desc} ${portInfo} ${state} ${mode} ${up}`.replace(/\s+/g, ' ');
   }
 
   async function tick(manual = false) {
@@ -397,9 +379,6 @@ async function renderServices() {
     else if (r.reused && r.message) toast(r.message);
     // 进程起来了但端口还没就绪：必须提示，否则界面显示「未运行」会被当成操作失败
     else if (r.warn) toast(r.warn, true);
-    // 附属服务启动失败单独提示（主服务仍然成功时不打断）
-    const bad = (r.companions || []).filter((c) => !c.ok && c.error);
-    if (bad.length) toast('附属服务启动失败：' + bad.map((c) => `${c.name}（${c.error}）`).join('、'), true);
     lastSig = '';
     tick();
     // 端口打开有延迟：1s / 3s / 6s 各补刷一次，状态和链接按钮尽快点亮
@@ -474,139 +453,6 @@ async function renderServices() {
   }, SVC_POLL_MS);
 }
 
-/* ---------- 视图 3：凭证配置 ---------- */const QB_FIELDS = [
-  { path: 'ownerQQ', label: '主人 QQ 号（ownerQQ）', type: 'text' },
-  { path: 'allow.private', label: '允许私聊的 QQ 号（多个用英文逗号分隔）', type: 'list' },
-  { path: 'allow.groups', label: '允许的群号（多个用英文逗号分隔）', type: 'list' },
-  { path: 'dsh.baseUrl', label: 'DSH 地址（如 http://127.0.0.1:3080）' },
-  { path: 'dsh.authToken', label: 'DSH 凭证 authToken', secret: true },
-  { path: 'dsh.model', label: 'DSH 模型名' },
-  { path: 'dsh.provider', label: 'DSH provider' },
-  { path: 'snowluma.accessToken', label: 'SnowLuma accessToken（HTTP :3000 那个）', secret: true },
-  { path: 'snowluma.wsUrl', label: 'SnowLuma WS 地址' },
-  { path: 'snowluma.httpUrl', label: 'SnowLuma HTTP 地址' },
-  { path: 'snowluma.homeDir', label: 'SnowLuma 所在目录' },
-  { path: 'consolePort', label: 'bridge 控制台端口', type: 'number' },
-  { path: 'consoleToken', label: 'bridge 控制台 token（可留空）', secret: true },
-];
-
-async function renderConfig() {
-  $content.innerHTML = '';
-  $content.append(el('h1', {}, '凭证配置'));
-  $content.append(el('p', { class: 'sub' }, '表单直接写入各组件的 config.json；保存前自动备份为 .bak。'));
-
-  const tabs = el('div', { class: 'tabs' },
-    el('button', { class: selectedTab === 'qqbridge' ? 'active' : '', onclick: () => { selectedTab = 'qqbridge'; renderConfig(); } }, 'qq-bridge'),
-    el('button', { class: selectedTab === 'snowluma' ? 'active' : '', onclick: () => { selectedTab = 'snowluma'; renderConfig(); } }, 'SnowLuma')
-  );
-  $content.append(tabs);
-
-  if (selectedTab === 'qqbridge') return renderQbForm();
-  return renderSnowForm();
-}
-
-async function renderQbForm() {
-  const cfg = await window.api.invoke('config:read', 'qqbridge');
-  if (cfg.error) {
-    $content.append(el('div', { class: 'card' }, el('p', { class: 'detail' }, cfg.error + '——请先在"环境检测"页安装 qq-bridge。')));
-    return;
-  }
-  const inputs = [];
-  const form = el('div', { class: 'card' });
-  for (const f of QB_FIELDS) {
-    const val = getList(cfg.data, f.path);
-    let input;
-    if (f.secret) {
-      input = el('input', { type: 'password', value: val || '' });
-      const eye = el('button', { class: 'btn', onclick: () => {
-        input.type = input.type === 'password' ? 'text' : 'password';
-        eye.textContent = input.type === 'password' ? '👁' : '🙈';
-      } }, '👁');
-      form.append(el('div', { class: 'field' }, el('label', {}, f.label), el('div', { class: 'secret-row' }, input, eye)));
-    } else {
-      input = el('input', { type: f.type === 'number' ? 'number' : 'text', value: val === undefined || val === null ? '' : String(val) });
-      form.append(el('div', { class: 'field' }, el('label', {}, f.label), input));
-    }
-    inputs.push({ f, input });
-  }
-  form.append(el('button', { class: 'btn primary', onclick: async () => {
-    const apply = [];
-    for (const { f, input } of inputs) {
-      let v = input.value.trim();
-      if (f.type === 'list') v = v ? v.split(/[,，\s]+/).map((x) => (Number(x) || x)).filter(Boolean) : [];
-      else if (f.type === 'number') v = Number(v) || 0;
-      apply.push({ path: f.path, value: v });
-    }
-    const r = await window.api.invoke('config:write', { file: cfg.file, apply });
-    toast(r.ok ? '已保存（原文件备份为 config.json.bak）' : '保存失败', !r.ok);
-  } }, '💾 保存配置'));
-  $content.append(form);
-}
-
-async function renderSnowForm() {
-  const cfg = await window.api.invoke('config:read', 'snowluma');
-  if (cfg.error) {
-    $content.append(el('div', { class: 'card' }, el('p', { class: 'detail' }, cfg.error + '——请先在"环境检测"页安装 SnowLuma。')));
-    return;
-  }
-  // runtime.json: webuiPort
-  const rtInputs = [];
-  const rtForm = el('div', { class: 'card' }, el('h3', {}, 'runtime.json'));
-  for (const f of [{ path: 'webuiPort', label: 'WebUI 端口', type: 'number' }]) {
-    const input = el('input', { type: f.type, value: cfg.runtime[f.path] ?? '' });
-    rtInputs.push({ f, input });
-    rtForm.append(el('div', { class: 'field' }, el('label', {}, f.label), input));
-  }
-  rtForm.append(el('button', { class: 'btn primary', onclick: async () => {
-    const apply = rtInputs.map(({ f, input }) => ({ path: f.path, value: Number(input.value) || input.value }));
-    await window.api.invoke('config:write', { file: cfg.runtimeFile, apply });
-    toast('已保存');
-  } }, '💾 保存'));
-  $content.append(rtForm);
-
-  // onebot_*.json：每个登录账号的 token / 端口
-  for (const ob of cfg.onebots || []) {
-    const http0 = ob.data.networks?.httpServers?.[0] || {};
-    const ws0 = ob.data.networks?.wsServers?.[0] || {};
-    const fields = [
-      { path: 'networks.httpServers.0.accessToken', label: 'HTTP accessToken（填到 qq-bridge 的 snowluma.accessToken）', value: http0.accessToken || '', secret: true },
-      { path: 'networks.httpServers.0.port', label: 'HTTP 端口', value: http0.port || 3000 },
-      { path: 'networks.wsServers.0.accessToken', label: 'WS accessToken', value: ws0.accessToken || '', secret: true },
-      { path: 'networks.wsServers.0.port', label: 'WS 端口', value: ws0.port || 3001 },
-    ];
-    const inputs = [];
-    const form = el('div', { class: 'card' }, el('h3', {}, `OneBot（${ob.name}）`));
-    for (const f of fields) {
-      const input = el('input', { type: f.secret ? 'password' : 'number', value: f.value });
-      inputs.push({ f, input });
-      const row = el('div', { class: 'field' }, el('label', {}, f.label), input);
-      if (f.secret) {
-        const eye = el('button', { class: 'btn', onclick: () => { input.type = input.type === 'password' ? 'text' : 'password'; } }, '👁');
-        row.append(el('div', { class: 'secret-row' }, input, eye));
-      }
-      form.append(row);
-    }
-    form.append(el('button', { class: 'btn primary', onclick: async () => {
-      const apply = inputs.map(({ f, input }) => ({ path: f.path, value: f.secret ? input.value.trim() : Number(input.value) || 0 }));
-      await window.api.invoke('config:write', { file: ob.file, apply });
-      toast('已保存（改端口需重启 SnowLuma 生效）');
-    } }, '💾 保存'));
-    $content.append(form);
-  }
-}
-
-// 统一取值：点路径 + 数组下标
-function getList(obj, dotted) {
-  const keys = dotted.split('.');
-  let cur = obj;
-  for (const k of keys) {
-    if (cur === null || cur === undefined) return '';
-    cur = cur[k];
-  }
-  if (Array.isArray(cur)) return cur.join(',');
-  return cur;
-}
-
 /* ---------- 视图 4：高级设置 ---------- */
 async function renderSettings() {
   const s = await window.api.invoke('settings:get');
@@ -629,14 +475,13 @@ async function renderSettings() {
   const cardComp = el('div', { class: 'card' }, el('h3', {}, '组件目录'));
   cardComp.append(dirField('snowluma', 'SnowLuma 目录', s.components.snowluma?.dir));
   cardComp.append(dirField('dsh', 'DSH 目录', s.components.dsh?.dir));
-  cardComp.append(dirField('qqbridge', 'qq-bridge 目录', s.components.qqbridge?.dir));
 
   const dshCmd = el('input', { type: 'text', value: s.components.dsh?.startCommand || '', placeholder: '留空 = 自动用 DSH 自带 CLI 跑 dsh web（3080 端口）' });
   const dshPort = el('input', { type: 'number', value: s.components.dsh?.port || 3080 });
   const dshWs = el('input', { type: 'text', value: s.components.dsh?.workspace || '', placeholder: '留空 = 自动（~/Documents/deepseek-harness）' });
   cardComp.append(
     el('div', { class: 'field' }, el('label', {}, 'DSH 启动命令（留空自动：exe + 内嵌 CLI 跑 web profile；不要填桌面 exe 路径——那只开 GUI 不开 3080）'), dshCmd),
-    el('div', { class: 'field' }, el('label', {}, 'DSH 端口（留空时以 qq-bridge 配置里的 dsh.baseUrl 为准）'), dshPort),
+    el('div', { class: 'field' }, el('label', {}, 'DSH Web API 端口'), dshPort),
     el('div', { class: 'field' }, el('label', {}, 'DSH 工作区目录（agent 读写文件的根目录）'), dshWs)
   );
 
@@ -645,7 +490,6 @@ async function renderSettings() {
   for (const [key, label] of [
     ['snowluma', 'SnowLuma（官网/zip 直链）'],
     ['dsh', 'DSH（官网/zip 直链）'],
-    ['qqbridge', 'qq-bridge（GitHub zip）'],
     ['node', 'Node 便携版（zip）'],
   ]) {
     const input = el('input', { type: 'text', value: s.downloads?.[key] || '', placeholder: 'zip 直链 = 自动下载解压；网页地址 = 打开浏览器' });
@@ -658,6 +502,15 @@ async function renderSettings() {
   chkClose.checked = !!s.closeStopServices;
   cardMisc.append(el('label', { class: 'check' }, chkClose, '关闭软件时停止所有由管理器启动的服务'));
 
+  // 关闭按钮行为：关闭询问对话框里勾过「记住我的选择」后，在这里改回
+  const closeSel = el('select', {},
+    el('option', { value: 'ask' }, '每次询问（默认）'),
+    el('option', { value: 'minimize' }, '最小化到任务栏（服务继续运行）'),
+    el('option', { value: 'exit' }, '完全退出程序'),
+  );
+  closeSel.value = ['ask', 'minimize', 'exit'].includes(s.closeAction) ? s.closeAction : 'ask';
+  cardMisc.append(el('div', { class: 'field' }, el('label', {}, '点击窗口关闭按钮时'), closeSel));
+
   // GitHub 加速镜像：留空=官方直连（失败自动走内置镜像兜底）
   const ghMirror = el('input', { type: 'text', value: s.githubMirror || '', placeholder: '留空=直连（失败自动走内置镜像）；如 https://ghfast.top' });
   cardMisc.append(el('div', { class: 'field' }, el('label', {}, 'GitHub 加速镜像（检查更新/下载用）'), ghMirror));
@@ -668,10 +521,10 @@ async function renderSettings() {
       components: {
         snowluma: { dir: dirInputs.snowluma.value.trim() },
         dsh: { dir: dirInputs.dsh.value.trim(), startCommand: dshCmd.value.trim(), port: Number(dshPort.value) || 3080, workspace: dshWs.value.trim() },
-        qqbridge: { dir: dirInputs.qqbridge.value.trim() },
       },
       downloads: Object.fromEntries(Object.entries(dlInputs).map(([k, i]) => [k, i.value.trim()])),
       closeStopServices: chkClose.checked,
+      closeAction: closeSel.value,
       githubMirror: ghMirror.value.trim(),
     });
     toast('设置已保存');
@@ -761,7 +614,7 @@ footStatus();
 setInterval(footStatus, 5000); // 任何页面都刷新（原来在服务管理页跳过，导致底部计数假死）
 
 /* ---------- 路由 ---------- */
-const VIEWS = { home: renderHome, services: renderServices, config: renderConfig, settings: renderSettings };
+const VIEWS = { home: renderHome, services: renderServices, settings: renderSettings };
 
 document.getElementById('nav').addEventListener('click', (e) => {
   const btn = e.target.closest('button[data-view]');

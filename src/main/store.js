@@ -6,16 +6,9 @@ const path = require('path');
 
 // 各下载源默认值。snowluma / dsh 默认官网地址（网页跳转），用户可在"高级设置"里覆盖；
 // 填了 zip 直链就自动下载解压，只填网页地址就跳浏览器。
-// qq-bridge 仓库是源码包（archive/refs/heads/main.zip），GitHub 直连在国内基本拿不到，
-// 所以默认地址直接套 gh-proxy.org 前缀；用户可以在高级设置里换成自己的镜像或直连。
-const QQBRIDGE_DEFAULT = 'https://gh-proxy.org/https://github.com/Serein1202/qq-bridge/archive/refs/heads/main.zip';
-// 旧版默认地址：只用来识别「用户没改过」，命中就迁移到新地址（用户自己填过的绝不动）
-const QQBRIDGE_LEGACY = 'https://github.com/Serein1202/qq-bridge/archive/refs/heads/main.zip';
-
 const DEFAULT_DOWNLOADS = {
   snowluma: 'https://github.com/SnowLuma/SnowLuma/releases',
   dsh: 'https://www.deepseek.com/harness/',
-  qqbridge: QQBRIDGE_DEFAULT,
   node: 'https://npmmirror.com/mirrors/node/v22.14.0/node-v22.14.0-win-x64.zip',
 };
 
@@ -24,15 +17,16 @@ const DEFAULT_SETTINGS = {
   components: {
     snowluma: { dir: '' },
     dsh: { dir: '', startCommand: '', port: 3080, workspace: '' },
-    qqbridge: { dir: '' },
   },
   downloads: { ...DEFAULT_DOWNLOADS },
   // 扫描根目录：packaged 模式默认 exe 所在目录；dev 模式默认项目上两级
   scanRoot: '',
+  // 点窗口关闭按钮时的行为：ask=每次询问 / minimize=最小化（服务继续跑）/ exit=完全退出
+  closeAction: 'ask',
   // 关闭软件时是否停掉所有由本软件拉起的服务
   closeStopServices: false,
   // 子进程崩溃后是否自动重启（每服务可覆盖）
-  autoRestart: { snowluma: false, dsh: false, qqbridge: false },
+  autoRestart: { snowluma: false, dsh: false },
   // GitHub 加速镜像前缀（留空=官方直连，失败自动走内置镜像兜底；如 https://ghfast.top）
   githubMirror: '',
 };
@@ -63,15 +57,6 @@ function loadSettings() {
   } catch {
     out = JSON.parse(JSON.stringify(DEFAULT_SETTINGS));
   }
-  // 迁移 qq-bridge 默认下载地址。deepMerge 会让老 settings.json 里的旧值一直生效，
-  // 只改 DEFAULT_DOWNLOADS 对已装过的机器等于没改。
-  // 仅当值恰好等于旧默认值时才替换 —— 那是「用户从没改过」的唯一可靠标志，
-  // 用户自己填的镜像/直连原样保留。
-  try {
-    if (out && out.downloads && out.downloads.qqbridge === QQBRIDGE_LEGACY) {
-      out.downloads.qqbridge = QQBRIDGE_DEFAULT;
-    }
-  } catch { /* 结构异常就算了，不影响主流程 */ }
   return out;
 }
 

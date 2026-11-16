@@ -1,6 +1,6 @@
 // preload.js — 安全桥：渲染进程只能通过 window.api 调主进程
 // 通道白名单：只放行 src/main/ipc.js 里实际注册的 handle 通道与事件推送通道，
-// 防止渲染层被 XSS 后滥用任意 IPC（对应 update:install / config:write 等敏感 handler）。
+// 防止渲染层被 XSS 后滥用任意 IPC（对应 update:install 等敏感 handler）。
 'use strict';
 const { contextBridge, ipcRenderer } = require('electron');
 
@@ -15,11 +15,8 @@ const INVOKE_CHANNELS = new Set([
   'svc:restart',
   'svc:startAll',
   'svc:stopAll',
-  'config:read',
-  'config:write',
   'dl:install',
   'dl:openPage',
-  'fix:npmInstall',
   'settings:get',
   'settings:set',
   'pick:dir',
