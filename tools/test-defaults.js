@@ -25,7 +25,16 @@ console.log('== 默认下载源仍可用 ==');
 {
   // node 便携版是 npm install 的前置依赖，必须是 zip 直链
   ok('node 是 zip 直链', /node:\s*'https:\/\/npmmirror\.com\/mirrors\/node\/v[\d.]+\/node-v[\d.]+-win-x64\.zip'/.test(store));
-  ok('snowluma / dsh 仍是网页地址（由用户到高级设置填 zip）', /snowluma:\s*'https:\/\//.test(store) && /dsh:\s*'https:\/\//.test(store));
+
+  // snowluma 默认走 release 资产的 zip 直链（installComponent 用 /\.zip($|\?)/ 判断走下载还是跳网页）
+  const SNOW = 'https://gh-proxy.org/https://github.com/Serein1202/Snowluma/releases/download/SnowLuma-v2.4.2-win-x64/SnowLuma-v2.4.2-win-x64.zip';
+  ok('snowluma 常量值等于约定地址', store.includes(`'${SNOW}'`), SNOW);
+  ok('snowluma 默认值引用常量', /snowluma:\s*SNOWLUMA_DEFAULT/.test(store));
+  ok('snowluma 以 .zip 结尾（否则会走网页跳转分支）', SNOW.endsWith('.zip'));
+  ok('snowluma 走 gh-proxy 加速前缀', /SNOWLUMA_DEFAULT\s*=\s*'https:\/\/gh-proxy\.org\/https:\/\/github\.com\//.test(store));
+  ok('snowluma 指向 releases/download 资产', /\/releases\/download\//.test(SNOW));
+
+  ok('dsh 仍是网页地址（官方无稳定 zip 直链）', /dsh:\s*'https:\/\//.test(store));
 }
 
 console.log(`\n结果：${pass} 通过，${fail} 失败`);

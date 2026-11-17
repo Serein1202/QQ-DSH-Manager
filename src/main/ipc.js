@@ -193,6 +193,15 @@ function isUnderScanRoots(p) {
 }
 
 // ---------- 安装流程 ----------
+// GitHub 直链下载候选：配置了镜像前缀只走镜像；否则先直连官方，失败自动换内置镜像兜底。
+// 与「检查更新」里的 githubDlCandidates 同规则，避免国内直连 releases 卡死在下载阶段。
+function installDlCandidates(url) {
+  if (!/^https?:\/\/(www\.)?github\.com\//i.test(url)) return [url];
+  const mirror = (settings().githubMirror || '').trim().replace(/\/+$/, '');
+  if (mirror) return [githubMirrorUrl(url, mirror)];
+  return [url, ...GITHUB_MIRRORS.map((m) => githubMirrorUrl(url, m))];
+}
+
 async function installComponent(key, targetDir, onStep) {
   const s = settings();
   const url = s.downloads[key];
@@ -222,7 +231,22 @@ async function installComponent(key, targetDir, onStep) {
 
   step('下载压缩包…');
   const tmpZip = path.join(defaultScanRoot(), `__dl_${key}.zip`);
-  await downloadFile(url, tmpZip, (r, t) => send('dl:progress', { key, received: r, total: t }), { verifyZip: true });
+  const onProgress = (r, t) => send('dl:progress', { key, received: r, total: t });
+  let lastErr = null;
+  for (const u of installDlCandidates(url)) {
+    try {
+      await downloadFile(u, tmpZip, onProgress, { verifyZip: true });
+      lastErr = null;
+      break;
+    } catch (e) {
+      lastErr = e;
+      // 换源前必须清掉 .part：否则断点续传会拿上一个源的字节接着写，拼出坏包
+      fs.rmSync(tmpZip + '.part', { force: true });
+      fs.rmSync(tmpZip, { force: true });
+      step(`下载失败（${e.message}），换下一个源重试…`);
+    }
+  }
+  if (lastErr) throw lastErr;
   step('解压…');
   unzip(tmpZip, targetDir);
   fs.unlinkSync(tmpZip);

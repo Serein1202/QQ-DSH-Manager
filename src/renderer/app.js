@@ -92,7 +92,7 @@ async function renderHome() {
   // SnowLuma
   const snowCard = card('SnowLuma（QQ 协议端）', d.snowluma, [
     d.snowluma.state === 'missing'
-      ? actBtn('下载 / 官网页面', true, () => runInstall('snowluma', null))
+      ? actBtn('一键下载安装', true, () => runInstall('snowluma', null))
       : el('span', { class: 'detail' }, d.snowluma.dir),
     specDirBtn('snowluma'),
     d.snowluma.state !== 'missing' ? actBtn('打开目录', false, () => window.api.invoke('shell:openPath', d.snowluma.dir)) : null,
@@ -505,7 +505,7 @@ async function renderSettings() {
   // 关闭按钮行为：关闭询问对话框里勾过「记住我的选择」后，在这里改回
   const closeSel = el('select', {},
     el('option', { value: 'ask' }, '每次询问（默认）'),
-    el('option', { value: 'minimize' }, '最小化到任务栏（服务继续运行）'),
+    el('option', { value: 'minimize' }, '最小化到托盘（服务继续运行）'),
     el('option', { value: 'exit' }, '完全退出程序'),
   );
   closeSel.value = ['ask', 'minimize', 'exit'].includes(s.closeAction) ? s.closeAction : 'ask';

@@ -4,10 +4,13 @@ const { app } = require('electron');
 const fs = require('fs');
 const path = require('path');
 
-// 各下载源默认值。snowluma / dsh 默认官网地址（网页跳转），用户可在"高级设置"里覆盖；
-// 填了 zip 直链就自动下载解压，只填网页地址就跳浏览器。
+// 各下载源默认值。填了 zip 直链就自动下载解压，只填网页地址就跳浏览器。
+// snowluma 直接指向 release 资产的 zip 直链，并套 gh-proxy 前缀（GitHub 直连在国内基本拿不到）；
+// dsh 官方没有稳定直链，仍走网页。
+const SNOWLUMA_DEFAULT = 'https://gh-proxy.org/https://github.com/Serein1202/Snowluma/releases/download/SnowLuma-v2.4.2-win-x64/SnowLuma-v2.4.2-win-x64.zip';
+
 const DEFAULT_DOWNLOADS = {
-  snowluma: 'https://github.com/SnowLuma/SnowLuma/releases',
+  snowluma: SNOWLUMA_DEFAULT,
   dsh: 'https://www.deepseek.com/harness/',
   node: 'https://npmmirror.com/mirrors/node/v22.14.0/node-v22.14.0-win-x64.zip',
 };
@@ -21,7 +24,7 @@ const DEFAULT_SETTINGS = {
   downloads: { ...DEFAULT_DOWNLOADS },
   // 扫描根目录：packaged 模式默认 exe 所在目录；dev 模式默认项目上两级
   scanRoot: '',
-  // 点窗口关闭按钮时的行为：ask=每次询问 / minimize=最小化（服务继续跑）/ exit=完全退出
+  // 点窗口关闭按钮时的行为：ask=每次询问 / minimize=最小化到托盘（服务继续跑）/ exit=完全退出
   closeAction: 'ask',
   // 关闭软件时是否停掉所有由本软件拉起的服务
   closeStopServices: false,
