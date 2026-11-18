@@ -38,6 +38,10 @@ npm run dist:dir   # 只出解压目录 release/win-unpacked，不打 zip（本�
 
 zip 是就地解压运行，程序目录 == 你解压的目录，更新脚本能原地覆盖，链路才闭环。
 
+软件内点"检查更新"后：下载 zip → 解压到程序目录的 `update-new/` → 校验 `QQ-DSH-Manager.exe` 与 `resources/app.asar` 齐全 → 生成 `cm-apply-update.ps1` 并退出 → 脚本等旧进程彻底退出后用 robocopy 覆盖、启动新版、自删。失败时程序目录会留下 `cm-update.log` / `update-new/`，看日志即可定位。
+
+> **升级旧版本注意**：1.1.0 及更早的构建里解压逻辑有 bug（release zip 顶层同时有文件和多个目录时只拷了第一个目录），下载的更新包会找不到 exe，表现就是"下载 100% 后没反应"。这个 bug 只能靠**手动下载新 zip 覆盖一次目录**来跨过去（设置存在 userData，不会被覆盖）；覆盖之后软件内自动更新才恢复可用。
+
 GitHub Actions（`.github/workflows/release.yml`）在 push 到 main 时自动递增 patch 版本号、打 zip、发 Release。
 
 ## 首次部署流程（小白视角）

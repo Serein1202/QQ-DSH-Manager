@@ -7,11 +7,12 @@
   "license": "MIT",
   "scripts": {
     "start": "electron .",
-    "test": "node tools/test-restart.js && node tools/test-restart-e2e.js && node tools/test-release-config.js && node tools/test-defaults.js",
+    "test": "node tools/test-restart.js && node tools/test-restart-e2e.js && node tools/test-release-config.js && node tools/test-defaults.js && node tools/test-update-apply.js",
     "test:unit": "node tools/test-restart.js",
     "test:e2e": "node tools/test-restart-e2e.js",
     "test:release": "node tools/test-release-config.js",
     "test:defaults": "node tools/test-defaults.js",
+    "test:update": "node tools/test-update-apply.js",
     "dist": "electron-builder --win zip",
     "dist:dir": "electron-builder --win dir"
   },

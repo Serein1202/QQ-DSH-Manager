@@ -145,10 +145,13 @@ function unzip(zipFile, destDir) {
   const ps =
     `$ErrorActionPreference='Stop';` +
     `Expand-Archive -Path '${sq(zipFile)}' -DestinationPath '${sq(tmpDir)}' -Force;` +
-    `$d = Get-ChildItem '${sq(tmpDir)}' -Directory | Select-Object -First 1;` +
-    `if ($d) { Copy-Item ($d.FullName + '\\*') '${sq(destDir)}' -Recurse -Force }` +
-    `else { Copy-Item '${sq(tmpDir)}\\*' '${sq(destDir)}' -Recurse -Force };` +
-    `Remove-Item '${sq(tmpDir)}' -Recurse -Force -ErrorAction SilentlyContinue`;
+    `$items = @(Get-ChildItem -LiteralPath '${sq(tmpDir)}' -Force);` +
+    `$dirs = @($items | Where-Object { $_.PSIsContainer });` +
+    `$files = @($items | Where-Object { -not $_.PSIsContainer });` +
+    `if ($dirs.Count -eq 1 -and $files.Count -eq 0) { $src = $dirs[0].FullName + '\\*' }` +
+    `else { $src = '${sq(tmpDir)}' + '\\*' };` +
+    `Copy-Item -Path $src -Destination '${sq(destDir)}' -Recurse -Force;` +
+    `Remove-Item -LiteralPath '${sq(tmpDir)}' -Recurse -Force -ErrorAction SilentlyContinue`;
   const r = spawnSync('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', ps], {
     encoding: 'utf8',
     timeout: 300000,

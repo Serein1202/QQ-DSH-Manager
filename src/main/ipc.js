@@ -761,22 +761,50 @@ function registerIpc() {
         fs.rmdirSync(inner);
       }
       const exe = findMainExe(stage, 2);
-      if (!exe) throw new Error('更新包内未找到 QQ-DSH-Manager.exe');
+      if (!exe) throw new Error('更新包内未找到 QQ-DSH-Manager.exe（解压结果不完整，已中止更新）');
+      // 完整性校验：exe + app.asar 缺一不可。否则 robocopy 会把半残的目录覆盖上去，
+      // 新版启动直接失败，用户只能手动重装。
+      if (!fs.existsSync(path.join(stage, 'resources', 'app.asar'))) {
+        throw new Error('更新包解压不完整（缺 resources/app.asar），已中止更新；原版本未改动');
+      }
       const relPath = path.relative(stage, exe).split(path.sep).join('\\');
-      // 替换脚本：等旧进程退出 -> 强制结束残留同名单进程 -> 把 update-new 内容并入固定根 -> 启动新版 -> 自删
-      const bat = path.join(root, 'cm-apply-update.bat');
-      const batContent = [
-        '@echo off',
-        'timeout /t 2 /nobreak >nul',
-        'taskkill /f /im QQ-DSH-Manager.exe >nul 2>&1',
-        'xcopy /e /y /q "%~dp0update-new\\*" "%~dp0" >nul',
-        'rmdir /s /q "%~dp0update-new"',
-        'start "" "%~dp0' + relPath + '"',
-        'del "%~f0"',
+      // 替换脚本：等旧进程彻底退出 -> 把 update-new 并入程序目录 -> 启动新版 -> 自删。
+      // 用 PowerShell + robocopy 而不是原来的 cmd/.bat：
+      //  1) detached 启动的 cmd 没有控制台，bat 里的 `timeout /t` 会立刻失败，2 秒等待形同虚设；
+      //  2) xcopy 覆盖含子目录的目录树容易漏文件，robocopy /E 能可靠合并；
+      //  3) 单实例锁要求新进程启动时旧进程已彻底消失，脚本里显式轮询等待，避免新旧进程互相顶掉。
+      const sq = (s) => String(s).replace(/'/g, "''");
+      const ps1 = path.join(root, 'cm-apply-update.ps1');
+      const log = path.join(root, 'cm-update.log');
+      const script = [
+        "$ErrorActionPreference = 'Stop'",
+        `$root = '${sq(root)}'`,
+        `$stage = '${sq(stage)}'`,
+        `$exe = '${sq(path.join(root, relPath))}'`,
+        `$log = '${sq(log)}'`,
+        'Start-Sleep -Seconds 3', // 先让 app.quit() 正常退出（会走 before-quit，按设置停服务）
+        '$deadline = (Get-Date).AddSeconds(30)',
+        'while ((Get-Date) -lt $deadline) {',
+        "  $p = @(Get-Process -Name 'QQ-DSH-Manager' -ErrorAction SilentlyContinue)",
+        '  if ($p.Count -eq 0) { break }',
+        '  $p | ForEach-Object { try { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue } catch {} }',
+        '  Start-Sleep -Milliseconds 400',
+        '}',
+        'Start-Sleep -Milliseconds 500', // 进程消失后文件锁还没立刻释放，多等半秒再覆盖
+        '& robocopy $stage $root /E /R:2 /W:1 /NFL /NDL /NJH /NJS /NP /LOG:$log | Out-Null',
+        'if ($LASTEXITCODE -ge 8) { exit 1 }', // robocopy 0-7 都是成功，>=8 才是真失败
+        'Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue',
+        'Remove-Item -LiteralPath $log -Force -ErrorAction SilentlyContinue',
+        'Start-Process -FilePath $exe -WorkingDirectory $root',
+        'Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue',
       ].join('\r\n');
-      fs.writeFileSync(bat, batContent, 'utf8');
-      spawn('cmd.exe', ['/d', '/s', '/c', bat], { detached: true, stdio: 'ignore' }).unref();
-      setTimeout(() => app.quit(), 800);
+      fs.writeFileSync(ps1, script, 'utf8');
+      spawn('powershell.exe',
+        ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', ps1],
+        { detached: true, stdio: 'ignore', windowsHide: true }
+      ).unref();
+      // 给渲染层一点时间把「下载完成」提示画出来，再退出让脚本接管
+      setTimeout(() => app.quit(), 1500);
       return { ok: true, file: exe, relaunch: true };
     } catch (e) {
       return { ok: false, error: e.message };
